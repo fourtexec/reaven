@@ -1,0 +1,20 @@
+[package]
+name = "reaven"
+version = "0.1.0"
+edition = "2021"
+description = "A small server-relayed remote administration CLI"
+
+[[bin]]
+name = "reaven"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+base64 = "0.22"
+clap = { version = "4", features = ["derive", "env"] }
+crossterm = "=0.28.1"
+portable-pty = "=0.9.0"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+uuid = { version = "=1.11.0", features = ["v4"] }
