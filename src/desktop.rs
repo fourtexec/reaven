@@ -145,6 +145,9 @@ mod x11 {
         pub monitors: Vec<MonitorInfo>,
         bits_per_pixel: u8,
         lsb_first: bool,
+        root_width: u32,
+        root_height: u32,
+        root_depth: u8,
     }
 
     pub fn open() -> Result<Screen> {
@@ -162,12 +165,17 @@ mod x11 {
             .unwrap_or(32);
         let lsb_first = setup.image_byte_order == ImageOrder::LSB_FIRST;
         let monitors = query_monitors(&conn, root, screen_num)?;
+        let root_width = setup.roots[screen_num].width_in_pixels as u32;
+        let root_height = setup.roots[screen_num].height_in_pixels as u32;
         Ok(Screen {
             conn,
             root,
             monitors,
             bits_per_pixel,
             lsb_first,
+            root_width,
+            root_height,
+            root_depth: depth,
         })
     }
 
@@ -236,49 +244,145 @@ mod x11 {
             let monitor = self.monitors.get(index as usize).ok_or_else(|| {
                 anyhow!("monitor {index} does not exist; run `reaven screens` to list")
             })?;
-            let width = monitor.width.clamp(1, 32767) as u16;
-            let height = monitor.height.clamp(1, 32767) as u16;
+            let (x, y, width, height) = self.fit_to_root(monitor)?;
 
-            let reply = self
-                .conn
-                .get_image(
-                    ImageFormat::Z_PIXMAP,
-                    self.root,
-                    monitor.x as i16,
-                    monitor.y as i16,
-                    width,
-                    height,
-                    !0,
-                )
-                .context("asking the X server for an image")?
-                .reply()
-                .context("X server refused the capture (screen locked?)")?;
+            // Direct capture of the monitor's rectangle. If the X server refuses
+            // -- typically BadMatch, because RandR's monitor rectangles are in
+            // logical coordinates while the root pixmap is in device pixels
+            // (fractional scaling, mixed-DPI multi-head) -- fall back to grabbing
+            // the whole root, which is always inside the drawable, and crop.
+            let rgba = match self.grab(x, y, width, height) {
+                Ok(pixels) => pixels,
+                Err(direct) => {
+                    let full = self.grab(0, 0, self.root_width, self.root_height).map_err(|full| {
+                        anyhow!(
+                            "{full}\n(the direct capture of the monitor rectangle failed too: {direct})"
+                        )
+                    })?;
+                    crop(&full, self.root_width, x, y, width, height).with_context(|| {
+                        format!(
+                            "cropping monitor {index} out of the full-screen capture \
+                             ({width}x{height} at {x},{y})"
+                        )
+                    })?
+                }
+            };
 
-            let rgba = to_rgba(
-                &reply.data,
-                width as u32,
-                height as u32,
-                self.bits_per_pixel,
-                self.lsb_first,
-            )?;
             let frame = encode_jpeg(
                 &rgba,
-                width as u32,
-                height as u32,
+                width,
+                height,
                 max_width,
                 quality,
                 jpeg_encoder::ColorType::Rgba,
             )?;
-            Ok((
-                frame,
-                Geometry {
-                    x: monitor.x,
-                    y: monitor.y,
-                    width: width as u32,
-                    height: height as u32,
-                },
+            Ok((frame, Geometry { x, y, width, height }))
+        }
+
+        /// Intersect a monitor rectangle with the root window.
+        ///
+        /// Guards against reporting geometries that cannot be captured: monitors
+        /// at negative offsets, logical rectangles wider than the root under
+        /// display scaling, and monitor lists left over from a mode change.
+        fn fit_to_root(&self, monitor: &MonitorInfo) -> Result<(i32, i32, u32, u32)> {
+            fit_rect(monitor, self.root_width, self.root_height)
+        }
+
+        /// One `GetImage` against the root window, converted to RGBA.
+        ///
+        /// The plane mask is tried twice: everything, then only the bits the root
+        /// depth can hold. Deep-colour (30-bit) servers reject a mask that reaches
+        /// past the drawable's depth, and that single retry is the difference
+        /// between "screen capture failed" and a working capture on such setups.
+        fn grab(&self, x: i32, y: i32, width: u32, height: u32) -> Result<Vec<u8>> {
+            let depth_mask: u32 = match self.root_depth {
+                32 | 0 => !0,
+                d => (1u32 << d) - 1,
+            };
+            let mut last_error = None;
+            for mask in [(!0u32), depth_mask] {
+                let attempt = match self.conn.get_image(
+                    ImageFormat::Z_PIXMAP,
+                    self.root,
+                    x as i16,
+                    y as i16,
+                    width as u16,
+                    height as u16,
+                    mask,
+                ) {
+                    Ok(cookie) => cookie.reply().map_err(|e| e.to_string()),
+                    Err(e) => Err(e.to_string()),
+                };
+                match attempt {
+                    Ok(reply) => {
+                        return to_rgba(
+                            &reply.data,
+                            width,
+                            height,
+                            self.bits_per_pixel,
+                            self.lsb_first,
+                        )
+                    }
+                    Err(e) => last_error = Some(e),
+                }
+            }
+            Err(anyhow!(
+                "the X server refused GetImage for {width}x{height} at {x},{y} (root {}x{}, \
+                 depth {}): {}. Common causes: the screen is locked or the display is \
+                 asleep (DPMS), the request falls outside the root window, or this is a \
+                 Wayland session that does not expose the root pixmap",
+                self.root_width,
+                self.root_height,
+                self.root_depth,
+                last_error.unwrap_or_default()
             ))
         }
+    }
+
+/// Intersect a monitor rectangle with the root window, as a free function so
+    /// the maths can be tested without an X server.
+    fn fit_rect(monitor: &MonitorInfo, root_width: u32, root_height: u32) -> Result<(i32, i32, u32, u32)> {
+        let max_w = root_width as i32;
+        let max_h = root_height as i32;
+        let x0 = monitor.x.clamp(0, max_w);
+        let y0 = monitor.y.clamp(0, max_h);
+        let x1 = monitor.x.saturating_add(monitor.width as i32).clamp(0, max_w);
+        let y1 = monitor.y.saturating_add(monitor.height as i32).clamp(0, max_h);
+        let (w, h) = ((x1 - x0) as u32, (y1 - y0) as u32);
+        if w == 0 || h == 0 {
+            bail!(
+                "monitor {} '{}' sits at {}x{}+{},{} which is outside the root window \
+                 ({}x{}); RandR and the root disagree -- this usually means display \
+                 scaling or a stale monitor layout. Run `reaven screens` to see what \
+                 the agent reports",
+                monitor.index, monitor.name, monitor.width, monitor.height,
+                monitor.x, monitor.y, root_width, root_height
+            );
+        }
+        Ok((x0, y0, w.min(65535), h.min(65535)))
+    }
+
+    /// Cut a rectangle out of a tightly packed RGBA image.
+    fn crop(src: &[u8], src_width: u32, x: i32, y: i32, width: u32, height: u32) -> Result<Vec<u8>> {
+        let stride = (src_width * 4) as usize;
+        let row_bytes = (width * 4) as usize;
+        let start = y as usize * stride + x as usize * 4;
+        // The last row only needs `row_bytes`, not a whole stride: a crop that
+        // starts mid-row ends before the end of its final stride.
+        let end = start + (height as usize - 1) * stride + row_bytes;
+        if width == 0 || height == 0 || end > src.len() {
+            bail!(
+                "cannot crop {width}x{height} at {x},{y} out of a {}x{} image",
+                src_width,
+                src.len() / stride.max(1)
+            );
+        }
+        let mut out = Vec::with_capacity(row_bytes * height as usize);
+        for row in 0..height as usize {
+            let o = start + row * stride;
+            out.extend_from_slice(&src[o..o + row_bytes]);
+        }
+        Ok(out)
     }
 
     /// Convert an X11 ZPixmap into tightly packed RGBA.
@@ -369,7 +473,94 @@ mod x11 {
         fn rejects_short_buffers() {
             assert!(to_rgba(&[0, 0, 0], 4, 4, 32, true).is_err());
         }
+
+        fn monitor(x: i32, y: i32, width: u32, height: u32) -> super::super::MonitorInfo {
+            super::super::MonitorInfo {
+                index: 0,
+                name: "test".into(),
+                x,
+                y,
+                width,
+                height,
+                scale: 1.0,
+                primary: true,
+            }
+        }
+
+        #[test]
+        fn a_monitor_inside_the_root_is_captured_unchanged() {
+            let (x, y, w, h) = super::fit_rect(&monitor(0, 0, 1920, 1080), 1920, 1080).unwrap();
+            assert_eq!((x, y, w, h), (0, 0, 1920, 1080));
+        }
+
+        #[test]
+        fn a_second_monitor_is_offset_correctly() {
+            let (x, y, w, h) = super::fit_rect(&monitor(1920, 0, 1920, 1080), 3840, 1080).unwrap();
+            assert_eq!((x, y, w, h), (1920, 0, 1920, 1080));
+        }
+
+        #[test]
+        fn rectangles_larger_than_the_root_are_clamped() {
+            // e.g. fractional scaling: RandR reports a logical size the root cannot hold
+            let (x, y, w, h) = super::fit_rect(&monitor(0, 0, 3000, 2000), 1920, 1080).unwrap();
+            assert_eq!((x, y, w, h), (0, 0, 1920, 1080));
+        }
+
+        #[test]
+        fn negative_origins_are_clamped() {
+            let (x, y, w, h) = super::fit_rect(&monitor(-100, -50, 1920, 1080), 1920, 1080).unwrap();
+            assert_eq!((x, y, w, h), (0, 0, 1820, 1030));
+        }
+
+        #[test]
+        fn a_monitor_entirely_offscreen_is_reported_not_captured() {
+            let err = super::fit_rect(&monitor(4000, 0, 1920, 1080), 1920, 1080).unwrap_err();
+            assert!(format!("{err}").contains("outside the root window"));
+        }
+
+        #[test]
+        fn crop_extracts_the_requested_rectangle() {
+            // 3x2 image, one distinct byte value per pixel (RGBA), crop the right column
+            let src: Vec<u8> = (0..6u8).flat_map(|i| [i, i, i, 255]).collect();
+            let out = super::crop(&src, 3, 2, 0, 1, 2).unwrap();
+            assert_eq!(out, vec![2, 2, 2, 255, 5, 5, 5, 255]);
+        }
+
+        #[test]
+        fn crop_rejects_a_rectangle_outside_the_image() {
+            let src = vec![0u8; 3 * 2 * 4];
+            assert!(super::crop(&src, 3, 2, 0, 2, 2).is_err());
+        }
     }
+}
+
+/// Check every monitor once, at agent start-up, so a capture problem is reported
+/// when it happens rather than when someone first tries to watch the screen.
+#[cfg(feature = "screen")]
+pub fn self_test() -> Result<String> {
+    let screen = x11::open()?;
+    let mut report = String::new();
+    for monitor in &screen.monitors {
+        let status = match screen.capture(monitor.index, 64, 40) {
+            Ok((frame, geometry)) => format!(
+                "capture ok ({}x{} frame, {} bytes JPEG)",
+                geometry.width,
+                geometry.height,
+                frame.jpeg.len()
+            ),
+            Err(e) => format!("capture FAILED: {e:#}"),
+        };
+        report.push_str(&format!(
+            "  monitor {} '{}' {}x{} at {}+{} -- {}\n",
+            monitor.index, monitor.name, monitor.width, monitor.height, monitor.x, monitor.y, status
+        ));
+    }
+    Ok(report)
+}
+
+#[cfg(not(feature = "screen"))]
+pub fn self_test() -> Result<String> {
+    Ok(String::from("  (no screen support in this build)\n"))
 }
 
 #[cfg(feature = "screen")]
@@ -409,6 +600,7 @@ pub fn run_screen_stream(
     }
     let interval = Duration::from_millis(1000 / fps.clamp(1, 60) as u64);
     let mut next = Instant::now();
+    let mut last_error: Option<(String, Instant)> = None;
     while !stop.load(Ordering::Relaxed) {
         match screen.capture(monitor, max_width, quality) {
             Ok((frame, geometry)) => {
@@ -416,9 +608,21 @@ pub fn run_screen_stream(
                     break;
                 }
             }
-            // A transient failure (screen locked, mode switch) should not kill
-            // a live session: report and keep trying.
-            Err(e) => eprintln!("reaven: screen capture failed: {e}"),
+            // A transient failure (screen locked, mode switch) should not kill a
+            // live session: report it and keep trying. Repeated identical failures
+            // are collapsed so a locked screen does not flood the console at fps.
+            Err(e) => {
+                let message = format!("{e:#}");
+                let now = Instant::now();
+                let dominated = matches!(
+                    &last_error,
+                    Some((previous, at)) if previous == &message && now.duration_since(*at) < Duration::from_secs(10)
+                );
+                if !dominated {
+                    eprintln!("reaven: screen capture failed: {message}");
+                    last_error = Some((message, now));
+                }
+            }
         }
         next += interval;
         let now = Instant::now();

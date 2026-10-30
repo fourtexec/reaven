@@ -1,5 +1,32 @@
 # Changelog
 
+## Unreleased — capture failures are diagnosable, and often recoverable
+
+### Fixed
+- **`screen capture failed: X server refused the capture` was unactionable and
+  often avoidable.** Capture now clamps the requested rectangle to the root window,
+  retries the plane mask for deep-colour screens, and — if the direct request is
+  still refused — captures the whole root and crops the monitor out of it. That
+  last fallback fixes the common case where RandR reports logical monitor
+  rectangles that do not match the root pixmap (fractional scaling, mixed-DPI
+  multi-head).
+- The error message now names the rectangle, root size, depth and the X error, and
+  lists the likely causes instead of guessing "screen locked?".
+- Repeated identical capture failures during a stream are logged once per 10
+  seconds instead of once per frame.
+- `crop` bounds check was wrong for rectangles that start mid-row, which would have
+  rejected legitimate crops of a non-leftmost monitor in the full-root fallback.
+
+### Added
+- Agents print a **capture self-test at start-up** — every monitor with its
+  geometry and whether a frame can actually be grabbed. A failure is reported but
+  not fatal: shell, files and input keep working.
+- Troubleshooting section in `docs/RUNTIME.md` mapping X errors to causes.
+- 7 unit tests for the geometry clamping and cropping (20 unit tests total).
+
+
+
+
 ## 0.2.1 — no runtime dependencies
 
 ### Fixed
