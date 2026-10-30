@@ -30,6 +30,15 @@
   portal/PipeWire path was the source of the `libdbus` dependency. See
   `docs/RUNTIME.md`.
 
+### Documented
+- The watched machine shows **nothing** when its screen is viewed — no banner,
+  border, tray icon or animation — because capture is a bare framebuffer read and
+  the agent never creates a window. New e2e check asserts the window tree and
+  pixels are unchanged during a stream (`diff=0`), so an on-screen overlay cannot
+  be added later without failing the suite. See "What the watched machine shows"
+  in `docs/RUNTIME.md`, including the cases where an indicator is the
+  compositor's own and cannot be suppressed.
+
 ### Verified
 - 26 end-to-end checks pass against **both** the dynamic and the static binary.
 - Statistics on the static build: 20 fps sustained at native 1440x900 (requested

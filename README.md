@@ -286,6 +286,11 @@ the new features make them matter more.
   shell opens, and rejected input all print locally, so the machine's owner has a
   record. It is a log line, not a system tray indicator; do not treat it as a
   security control.
+- **Nothing is drawn on the watched screen.** No banner, border, tray icon or
+  animation appears when another device views it: capture is a bare framebuffer
+  read and the agent creates no window, and the e2e suite asserts the watched
+  desktop stays pixel-identical during a stream. Detection rests on the console
+  log and `ps`, above — not on anything visual.
 - **The Android app stores the relay password in plain SharedPreferences.**
   Acceptable for a LAN-only relay; not for a shared phone.
 - **No TLS, no audio, no clipboard sync, no file-transfer UI in the app.**
