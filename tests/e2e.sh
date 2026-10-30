@@ -46,6 +46,16 @@ fi
 
 export REAVEN_PASSWORD=$PASS
 
+# Xvfb only reflects pointer warps in XQueryPointer while some client has the
+# root pointer events selected, so start a listener before testing input. Without
+# this, `xdotool getmouselocation` reports the initial centre forever and the
+# input assertions fail for reasons that have nothing to do with Reaven.
+if command -v xev >/dev/null; then
+  xev -root -event mouse >"$OUT/xev.log" 2>&1 &
+  PIDS+=($!)
+  sleep 0.5
+fi
+
 step "starting relay on $SERVER"
 "$BIN" server --listen "$SERVER" >"$OUT/relay.log" 2>&1 &
 PIDS+=($!)
@@ -90,6 +100,29 @@ step "downscaling: --max-width 320"
 "$BIN" screenshot --server "$SERVER" --target testpc --output "$OUT/small.jpg" --max-width 320 >/dev/null 2>&1
 DIM=$(identify -format '%w' "$OUT/small.jpg" 2>/dev/null)
 [ "$DIM" = "320" ] && ok "resized to 320px wide" || bad "expected 320px wide, got '$DIM'"
+
+step "pixel fidelity: capture a known gradient and check channel order"
+# Guards the pure-Rust X11 backend against channel swaps / vertical flips: paint a
+# red->blue vertical gradient, then assert the top is red-dominant and the bottom
+# blue-dominant in the captured JPEG. Skipped if imagemagick is unavailable.
+if command -v convert >/dev/null && command -v display >/dev/null; then
+  convert -size 1440x900 gradient:'#ff0000'-'#0000ff' "$OUT/grad.png" 2>/dev/null
+  display -window root "$OUT/grad.png" >/dev/null 2>&1 &
+  sleep 1.5
+  "$BIN" screenshot --server "$SERVER" --target testpc --quality 98 --output "$OUT/grad.jpg" >/dev/null 2>&1
+  TOP=$(convert "$OUT/grad.jpg" -format '%[fx:int(255*p{100,60}.r)],%[fx:int(255*p{100,60}.b)]' info: 2>/dev/null)
+  BOT=$(convert "$OUT/grad.jpg" -format '%[fx:int(255*p{100,840}.r)],%[fx:int(255*p{100,840}.b)]' info: 2>/dev/null)
+  TOP_R=${TOP%%,*}; TOP_B=${TOP##*,}; BOT_R=${BOT%%,*}; BOT_B=${BOT##*,}
+  echo "    top R,B=$TOP   bottom R,B=$BOT"
+  if [ "${TOP_R:-0}" -gt 150 ] && [ "${TOP_B:-255}" -lt 100 ] && \
+     [ "${BOT_B:-0}" -gt 150 ] && [ "${BOT_R:-255}" -lt 100 ]; then
+    ok "red/blue channels and vertical orientation correct"
+  else
+    bad "colour/geometry wrong (top=$TOP bottom=$BOT)"
+  fi
+else
+  echo "    (skipped: imagemagick not installed)"
+fi
 
 step "webcam enumeration (no camera attached: expect a clean error)"
 CAM=$("$BIN" cameras --server "$SERVER" --target testpc 2>&1)

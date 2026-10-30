@@ -2,70 +2,77 @@
 
 ## TL;DR
 
-For normal desktop use: **nothing to install.** The binary needs only libraries
-every desktop Linux already has.
+**Nothing to install.** The shipped binary is statically linked: it pulls in no
+shared libraries at all, so no `libxcb`, no `libX11`, no `libdbus`, no `libxdo`,
+no `libv4l`, and no glibc-version dependency.
+
+```bash
+chmod +x artifacts/reaven-0.2.0-linux-x86_64
+./artifacts/reaven-0.2.0-linux-x86_64 --version
+```
+
+```
+$ ldd artifacts/reaven-0.2.0-linux-x86_64
+        statically linked
+```
 
 For the Android app: **nothing.** Android 8.0+ and a network connection.
 
-## What is actually required
+## Why this matters
 
-Measured from the shipped binary (`objdump -p`), not guessed:
+Screen capture used to be built on `xcap`, which links `libxcb.so.1` and
+`libdbus-1.so.3`. Because the dynamic loader resolves those *before `main()`
+runs*, a machine without them could not start the binary at all — so even
+`reaven exec`, which never touches a screen, died with:
 
-| Linked library | Needed for | Present by default? |
-|---|---|---|
-| `libc.so.6`, `libm.so.6`, `libgcc_s.so.1` | everything | yes |
-| `libxcb.so.1` | screen capture / input on X11 | yes on any GUI install |
-| `libdbus-1.so.3` | Wayland portal capture, session bus | yes on any desktop |
+```
+reaven: error while loading shared libraries: libxcb.so.1: cannot open shared object file
+```
 
-Not required: `libxdo` (this build uses enigo's pure-Rust X11 backend),
-`libpipewire`, `libv4l`/`libv4l2` (the webcam backend statically links its own
-V4L2 layer), GTK, Qt, Python, Node, or any runtime.
+Capture is now implemented directly on `x11rb`, which speaks the X protocol over
+the existing socket and needs no C library. Two consequences:
 
-### Per-feature extras
+* command-line use works on a machine with **no display and no X libraries**;
+* desktop commands fail with a message instead of preventing startup:
+
+```
+$ reaven screenshot --server host --target pc
+Error: connecting to the X server (is DISPLAY set? under Wayland, capture needs
+XWayland): $DISPLAY variable not set and no value was provided explicitly
+```
+
+## Per-feature requirements
 
 | Feature | Needs |
 |---|---|
-| relay, `exec`, `cl`, upload/download | nothing beyond the above |
-| screenshot / screen stream | an X11 session (`DISPLAY`), or `xdg-desktop-portal` on Wayland |
-| mouse + keyboard control | X11; on Wayland the compositor must support libei |
-| webcam | a `/dev/video*` device and membership of the `video` group (`sudo usermod -aG video $USER`) |
-| browser viewer | any browser; no server-side deps |
-| `install-autostart` | `flock` from util-linux (present on virtually every distro) |
+| relay, `exec`, `cl`, upload/download | nothing — works headless |
+| screenshot / screen stream | an X11 display (`DISPLAY`), or XWayland on Wayland |
+| mouse + keyboard control | same as above |
+| webcam | a `/dev/video*` device + membership of the `video` group |
+| browser viewer | any browser on the machine you are sitting at |
+| `install-autostart` | `flock` from util-linux |
 
-## Two prebuilt binaries in `artifacts/`
-
-| File | Size | What it is |
-|---|---|---|
-| `reaven-0.2.0-linux-x86_64` | 5.1 MB | Full build: relay, shell, screen, webcam, input. Dynamically linked. |
-| `reaven-0.2.0-relay-linux-x86_64-static` | 3.0 MB | Relay-only build (`--no-default-features`). **Statically linked — zero runtime dependencies**, runs on any x86-64 Linux including Alpine. |
-
-The static build has no screen/webcam/input code at all. If you point it at an
-agent it answers `this build has no screen support`, which is the intended
-behaviour — use it for the relay on a VPS or a minimal server.
+Fast check before blaming Reaven:
 
 ```bash
-./artifacts/reaven-0.2.0-relay-linux-x86_64-static server \
-    --listen 0.0.0.0:7331 --password 'a-long-random-secret'
+echo "$DISPLAY"                 # empty -> no X session for this process
+xdpyinfo | head -5              # can we talk to the display at all?
+id -nG | tr ' ' '\n' | grep video   # webcam permission
+ls /dev/video*                  # webcam devices
 ```
 
-## Two caveats worth knowing
+## Wayland
 
-**1. The full binary needs glibc 2.39+.** It was built on Debian 13. That covers
-Debian 13, Ubuntu 24.10+/25.04+, Fedora 40+, Arch, and similar. On Ubuntu 22.04
-(glibc 2.35), Debian 12 (2.36) or RHEL 9 you will get
-`version 'GLIBC_2.39' not found`. Two options:
+Capture and control run through **XWayland**. That covers X11 applications,
+which is most of them, but:
 
-```bash
-# a) build it yourself — one command, ~2 minutes
-cargo build --release
-# b) or install the two system libs you're missing and use the static relay build
-sudo apt install libdbus-1-3 libxcb1     # only if the full binary won't start
-```
+* a native Wayland window may be missing from the capture;
+* clicks and keys only reach XWayland clients, not native Wayland ones.
 
-**2. A headless server may not start the full binary at all.** Dynamic linking
-happens before `main()` runs, so a bare VPS without `libdbus-1-3`/`libxcb1`
-fails at startup even if you only want the relay. That is exactly what the
-static relay-only build is for.
+Native-Wayland capture needs an `xdg-desktop-portal` + PipeWire backend, which
+this build does not include — that backend is exactly what used to introduce the
+`libdbus`/`libxcb` dependency. If you need it, the old `xcap` path can be
+restored as an optional feature.
 
 ## Android
 
@@ -80,5 +87,18 @@ static relay-only build is for.
 adb install android/artifacts/reaven-control-0.2.0-debug.apk
 ```
 
-It is a **debug** build — fine to sideload, but it is not release-signed, so
-expect Play Protect to ask for confirmation.
+It is a **debug** build — fine to sideload, but not release-signed, so Play
+Protect will ask for confirmation.
+
+## Building it yourself
+
+If you would rather build (or need a different architecture):
+
+```bash
+cargo build --release                                       # dynamic, ~5 MB
+cargo build --release --target x86_64-unknown-linux-musl    # static, ~3.9 MB
+```
+
+The only build-time packages that matter are `libclang-dev` (for the webcam
+v4l2 bindings) and `pkg-config`. Drop webcam support and you need neither:
+`cargo build --release --no-default-features --features screen,input`.

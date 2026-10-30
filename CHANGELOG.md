@@ -1,5 +1,41 @@
 # Changelog
 
+## 0.2.1 — no runtime dependencies
+
+### Fixed
+- **Command-line use no longer depends on X11 libraries.** Screen capture was
+  built on `xcap`, which links `libxcb.so.1` and `libdbus-1.so.3`. The dynamic
+  loader resolves those before `main()`, so on a machine without them *every*
+  command died at startup — including `reaven exec`, which never touches a
+  screen. Capture is now implemented directly on `x11rb` (pure Rust, speaks the
+  X protocol over the socket), so the binary links no C libraries at all.
+- Desktop commands now fail with an actionable message at call time
+  (`is DISPLAY set? under Wayland, capture needs XWayland`) instead of aborting
+  the process.
+
+### Added
+- Fully static build: `cargo build --release --target x86_64-unknown-linux-musl`
+  produces a 3.9 MB binary with zero runtime dependencies and no glibc version
+  requirement. Shipped as `artifacts/reaven-0.2.0-linux-x86_64`, replacing the
+  two dynamic binaries.
+- Pure-Rust X11 capture: RandR 1.5 monitor enumeration (with a root-geometry
+  fallback for headless servers), ZPixmap -> RGBA conversion covering 16/24/32
+  bits per pixel in both byte orders.
+- e2e test that paints a red->blue gradient and asserts channel order and
+  vertical orientation of the capture, guarding the new backend against
+  channel swaps.
+
+### Changed
+- Native-Wayland capture is no longer included; XWayland is used instead. The
+  portal/PipeWire path was the source of the `libdbus` dependency. See
+  `docs/RUNTIME.md`.
+
+### Verified
+- 26 end-to-end checks pass against **both** the dynamic and the static binary.
+- Statistics on the static build: 20 fps sustained at native 1440x900 (requested
+  20 fps), 30 frames in a 3 s window during the e2e run.
+
+
 ## 0.2.0 — screen, webcam, input control, Android client
 
 Building on the upstream 0.1 relay/shell/file-transfer prototype.

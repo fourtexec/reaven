@@ -116,43 +116,265 @@ fn encode_jpeg(
 
 // ------------------------------------------------------------------ screens ---
 
+/// X11 capture built directly on `x11rb`.
+///
+/// `x11rb` speaks the X wire protocol over the socket itself, so the binary
+/// links **no C libraries** -- no `libxcb`, no `libX11`, no `libdbus`. That
+/// matters two ways:
+///
+///   1. a missing X library used to make the whole binary fail at load time
+///      (the loader runs before `main`), so even `reaven exec` on a headless
+///      server died with "libxcb.so.1: cannot open shared object file";
+///   2. it makes a fully static build possible.
+///
+/// Failures now happen at call time, with a message, only for the commands
+/// that actually need a display.
 #[cfg(feature = "screen")]
-fn monitors() -> Result<Vec<xcap::Monitor>> {
-    xcap::Monitor::all().context("enumerating monitors")
-}
+mod x11 {
+    use anyhow::{anyhow, bail, Context, Result};
+    use x11rb::connection::Connection;
+    use x11rb::protocol::randr::ConnectionExt as _;
+    use x11rb::protocol::xproto::{ConnectionExt as _, ImageFormat, ImageOrder, Window};
+    use x11rb::rust_connection::RustConnection;
 
-#[cfg(feature = "screen")]
-fn monitor_at(index: u32) -> Result<xcap::Monitor> {
-    let monitors = monitors()?;
-    if monitors.is_empty() {
-        bail!("no monitors detected (is DISPLAY or XDG_SESSION_TYPE set?)");
+    use super::{encode_jpeg, EncodedFrame, Geometry, MonitorInfo};
+
+    pub struct Screen {
+        conn: RustConnection,
+        root: Window,
+        pub monitors: Vec<MonitorInfo>,
+        bits_per_pixel: u8,
+        lsb_first: bool,
     }
-    monitors
-        .into_iter()
-        .nth(index as usize)
-        .ok_or_else(|| anyhow!("monitor {index} does not exist; run `reaven screens` to list"))
+
+    pub fn open() -> Result<Screen> {
+        let (conn, screen_num) = x11rb::connect(None).context(
+            "connecting to the X server (is DISPLAY set? under Wayland, capture needs XWayland)",
+        )?;
+        let setup = conn.setup();
+        let root = setup.roots[screen_num].root;
+        let depth = setup.roots[screen_num].root_depth;
+        let bits_per_pixel = setup
+            .pixmap_formats
+            .iter()
+            .find(|f| f.depth == depth)
+            .map(|f| f.bits_per_pixel)
+            .unwrap_or(32);
+        let lsb_first = setup.image_byte_order == ImageOrder::LSB_FIRST;
+        let monitors = query_monitors(&conn, root, screen_num)?;
+        Ok(Screen {
+            conn,
+            root,
+            monitors,
+            bits_per_pixel,
+            lsb_first,
+        })
+    }
+
+    fn query_monitors(
+        conn: &RustConnection,
+        root: Window,
+        screen_num: usize,
+    ) -> Result<Vec<MonitorInfo>> {
+        let mut out = Vec::new();
+
+        // RandR 1.5 exposes the logical monitor layout, which is what a user
+        // means by "my screen" (it also gets HiDPI scaling right).
+        if let Ok(cookie) = conn.randr_get_monitors(root, true) {
+            if let Ok(reply) = cookie.reply() {
+                for (index, m) in reply.monitors.iter().enumerate() {
+                    let name = conn
+                        .get_atom_name(m.name)
+                        .ok()
+                        .and_then(|c| c.reply().ok())
+                        .map(|r| String::from_utf8_lossy(&r.name).into_owned())
+                        .unwrap_or_else(|| format!("display {index}"));
+                    out.push(MonitorInfo {
+                        index: index as u32,
+                        name,
+                        x: m.x as i32,
+                        y: m.y as i32,
+                        width: m.width as u32,
+                        height: m.height as u32,
+                        scale: 1.0,
+                        primary: m.primary,
+                    });
+                }
+            }
+        }
+
+        // No RandR (headless Xvfb, ancient server): treat the whole root as one
+        // monitor rather than reporting "no monitors".
+        if out.is_empty() {
+            let screen = &conn.setup().roots[screen_num];
+            out.push(MonitorInfo {
+                index: 0,
+                name: "screen".to_string(),
+                x: 0,
+                y: 0,
+                width: screen.width_in_pixels as u32,
+                height: screen.height_in_pixels as u32,
+                scale: 1.0,
+                primary: true,
+            });
+        }
+        if !out.iter().any(|m| m.primary) {
+            if let Some(first) = out.first_mut() {
+                first.primary = true;
+            }
+        }
+        Ok(out)
+    }
+
+    impl Screen {
+        pub fn capture(
+            &self,
+            index: u32,
+            max_width: u32,
+            quality: u8,
+        ) -> Result<(EncodedFrame, Geometry)> {
+            let monitor = self.monitors.get(index as usize).ok_or_else(|| {
+                anyhow!("monitor {index} does not exist; run `reaven screens` to list")
+            })?;
+            let width = monitor.width.clamp(1, 32767) as u16;
+            let height = monitor.height.clamp(1, 32767) as u16;
+
+            let reply = self
+                .conn
+                .get_image(
+                    ImageFormat::Z_PIXMAP,
+                    self.root,
+                    monitor.x as i16,
+                    monitor.y as i16,
+                    width,
+                    height,
+                    !0,
+                )
+                .context("asking the X server for an image")?
+                .reply()
+                .context("X server refused the capture (screen locked?)")?;
+
+            let rgba = to_rgba(
+                &reply.data,
+                width as u32,
+                height as u32,
+                self.bits_per_pixel,
+                self.lsb_first,
+            )?;
+            let frame = encode_jpeg(
+                &rgba,
+                width as u32,
+                height as u32,
+                max_width,
+                quality,
+                jpeg_encoder::ColorType::Rgba,
+            )?;
+            Ok((
+                frame,
+                Geometry {
+                    x: monitor.x,
+                    y: monitor.y,
+                    width: width as u32,
+                    height: height as u32,
+                },
+            ))
+        }
+    }
+
+    /// Convert an X11 ZPixmap into tightly packed RGBA.
+    ///
+    /// X gives us a packed pixel buffer whose channel order depends on
+    /// bits-per-pixel and the server's byte order, plus an implicit row stride
+    /// that may include padding -- hence deriving stride from the payload size.
+    fn to_rgba(data: &[u8], width: u32, height: u32, bpp: u8, lsb_first: bool) -> Result<Vec<u8>> {
+        let (w, h) = (width as usize, height as usize);
+        if w == 0 || h == 0 {
+            bail!("captured an empty image");
+        }
+        if data.len() < h {
+            bail!("X server returned a truncated image ({} bytes)", data.len());
+        }
+        let stride = data.len() / h;
+        let bytes_per_pixel = (bpp as usize).div_ceil(8);
+        if stride < w * bytes_per_pixel {
+            bail!("unexpected image stride: {stride} bytes for {w}px at {bpp}bpp");
+        }
+
+        let mut out = vec![0u8; w * h * 4];
+        for y in 0..h {
+            let row = &data[y * stride..];
+            let out_row = &mut out[y * w * 4..(y + 1) * w * 4];
+            for x in 0..w {
+                let o = x * bytes_per_pixel;
+                let p = &row[o..o + bytes_per_pixel];
+                let (r, g, b) = match (bpp, lsb_first) {
+                    (32, true) => (p[2], p[1], p[0]),
+                    (32, false) => (p[1], p[2], p[3]),
+                    (24, true) => (p[2], p[1], p[0]),
+                    (24, false) => (p[0], p[1], p[2]),
+                    (16, true) | (16, false) => {
+                        let raw = if lsb_first {
+                            u16::from_le_bytes([p[0], p[1]])
+                        } else {
+                            u16::from_be_bytes([p[0], p[1]])
+                        };
+                        let scale = |v: u16, max: u16| ((v as u32 * 255) / max as u32) as u8;
+                        (
+                            scale((raw >> 11) & 0x1f, 0x1f),
+                            scale((raw >> 5) & 0x3f, 0x3f),
+                            scale(raw & 0x1f, 0x1f),
+                        )
+                    }
+                    _ => bail!("unsupported X11 pixel format: {bpp} bits per pixel"),
+                };
+                let q = x * 4;
+                out_row[q] = r;
+                out_row[q + 1] = g;
+                out_row[q + 2] = b;
+                out_row[q + 3] = 255;
+            }
+        }
+        Ok(out)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::to_rgba;
+
+        #[test]
+        fn converts_32bpp_bgra_little_endian() {
+            // Two pixels: pure red (0x00FF0000) and pure green, little-endian BGRX.
+            let data = vec![0, 0, 255, 0, 0, 255, 0, 0];
+            let rgba = to_rgba(&data, 2, 1, 32, true).unwrap();
+            assert_eq!(&rgba[0..4], &[255, 0, 0, 255]);
+            assert_eq!(&rgba[4..8], &[0, 255, 0, 255]);
+        }
+
+        #[test]
+        fn converts_24bpp_and_copes_with_row_padding() {
+            // 2px wide, 2 rows, 3 bytes/px + 2 bytes padding per row.
+            // Little-endian BGR: red is 00 00 FF, blue is FF 00 00.
+            let mut data = Vec::new();
+            for _ in 0..2 {
+                data.extend_from_slice(&[0, 0, 255, 255, 0, 0]); // red, blue
+                data.extend_from_slice(&[0, 0]); // row padding
+            }
+            let rgba = to_rgba(&data, 2, 2, 24, true).unwrap();
+            assert_eq!(&rgba[0..4], &[255, 0, 0, 255]);
+            assert_eq!(&rgba[4..8], &[0, 0, 255, 255]);
+            assert_eq!(&rgba[8..12], &[255, 0, 0, 255]);
+        }
+
+        #[test]
+        fn rejects_short_buffers() {
+            assert!(to_rgba(&[0, 0, 0], 4, 4, 32, true).is_err());
+        }
+    }
 }
 
 #[cfg(feature = "screen")]
 pub fn list_monitors() -> Result<Vec<MonitorInfo>> {
-    let all = monitors()?;
-    let mut out = Vec::with_capacity(all.len());
-    for (index, m) in all.iter().enumerate() {
-        let width = m.width().unwrap_or(0);
-        let height = m.height().unwrap_or(0);
-        let scale = m.scale_factor().unwrap_or(1.0);
-        out.push(MonitorInfo {
-            index: index as u32,
-            name: m.name().unwrap_or_else(|_| format!("display {index}")),
-            x: m.x().unwrap_or(0),
-            y: m.y().unwrap_or(0),
-            width,
-            height,
-            scale,
-            primary: index == 0,
-        });
-    }
-    Ok(out)
+    Ok(x11::open()?.monitors)
 }
 
 #[cfg(feature = "screen")]
@@ -161,23 +383,7 @@ pub fn capture_screen(
     max_width: u32,
     quality: u8,
 ) -> Result<(EncodedFrame, Geometry)> {
-    let m = monitor_at(monitor)?;
-    let geometry = Geometry {
-        x: m.x().unwrap_or(0),
-        y: m.y().unwrap_or(0),
-        width: m.width().unwrap_or(0),
-        height: m.height().unwrap_or(0),
-    };
-    let image = m.capture_image().context("capturing monitor")?;
-    let frame = encode_jpeg(
-        image.as_raw(),
-        image.width(),
-        image.height(),
-        max_width,
-        quality,
-        jpeg_encoder::ColorType::Rgba,
-    )?;
-    Ok((frame, geometry))
+    x11::open()?.capture(monitor, max_width, quality)
 }
 
 /// Stream a monitor until `stop` is set or `emit` returns `false`.
@@ -193,33 +399,25 @@ pub fn run_screen_stream(
     use std::sync::atomic::Ordering;
     use std::time::{Duration, Instant};
 
-    let m = monitor_at(monitor)?;
-    let geometry = Geometry {
-        x: m.x().unwrap_or(0),
-        y: m.y().unwrap_or(0),
-        width: m.width().unwrap_or(0),
-        height: m.height().unwrap_or(0),
-    };
+    let screen = x11::open()?;
+    // Fail fast on a bad index instead of streaming nothing.
+    if screen.monitors.get(monitor as usize).is_none() {
+        bail!(
+            "monitor {monitor} does not exist; this display has {} monitor(s)",
+            screen.monitors.len()
+        );
+    }
     let interval = Duration::from_millis(1000 / fps.clamp(1, 60) as u64);
     let mut next = Instant::now();
     while !stop.load(Ordering::Relaxed) {
-        let started = Instant::now();
-        match m.capture_image() {
-            Ok(image) => {
-                let encoded = encode_jpeg(
-                    image.as_raw(),
-                    image.width(),
-                    image.height(),
-                    max_width,
-                    quality,
-                    jpeg_encoder::ColorType::Rgba,
-                )?;
-                if !emit(encoded, geometry) {
+        match screen.capture(monitor, max_width, quality) {
+            Ok((frame, geometry)) => {
+                if !emit(frame, geometry) {
                     break;
                 }
             }
-            // A transient capture failure (screen locked, resize) should not
-            // kill a session; keep trying until the deadline.
+            // A transient failure (screen locked, mode switch) should not kill
+            // a live session: report and keep trying.
             Err(e) => eprintln!("reaven: screen capture failed: {e}"),
         }
         next += interval;
@@ -228,10 +426,6 @@ pub fn run_screen_stream(
             std::thread::sleep(next - now);
         } else {
             next = now; // fell behind: keep the cadence, don't try to catch up
-        }
-        // Guard against a pathological capture path pinning a core.
-        if started.elapsed() < Duration::from_millis(1) {
-            std::thread::sleep(Duration::from_millis(1));
         }
     }
     Ok(())

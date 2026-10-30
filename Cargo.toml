@@ -13,7 +13,7 @@ path = "src/main.rs"
 # Everything on by default. Turn features off for a smaller/headless build,
 # e.g. `cargo build --no-default-features --features screen,input`.
 default = ["screen", "input", "webcam"]
-screen = ["dep:xcap", "dep:image", "dep:jpeg-encoder"]
+screen = ["dep:x11rb", "dep:image", "dep:jpeg-encoder"]
 webcam = ["dep:nokhwa", "dep:image", "dep:jpeg-encoder"]
 input = ["dep:enigo"]
 
@@ -29,7 +29,9 @@ tokio = { version = "1", features = ["full"] }
 uuid = { version = "=1.11.0", features = ["v4"] }
 
 # --- desktop capture / injection (feature-gated) ---
-xcap = { version = "0.4", optional = true }
+# Pure-Rust X11 client: links no C libraries, so a missing libxcb or
+# libdbus can never stop the binary from starting.
+x11rb = { version = "0.13", optional = true, default-features = false, features = ["randr"] }
 enigo = { version = "0.6", optional = true }
 nokhwa = { version = "0.10", optional = true, default-features = false, features = ["input-native"] }
 image = { version = "0.25", optional = true, default-features = false, features = ["png", "jpeg"] }

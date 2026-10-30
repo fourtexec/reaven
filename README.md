@@ -33,12 +33,22 @@ sudo install -m 0755 target/release/reaven /usr/local/bin/reaven
 
 ### System packages
 
-| Feature | Linux (Debian/Ubuntu) | Notes |
+| Feature | Build-time packages | Runtime packages |
 |---|---|---|
-| relay, shell, files only | — | `cargo build --no-default-features` |
-| `screen` (capture) | `libxcb1-dev libdbus-1-dev` (X11) | Wayland needs the desktop portal |
-| `input` (injection) | `libxkbcommon-dev` | pure-Rust X11 backend, no `libxdo` |
-| `webcam` | `libclang-dev` (build), `libv4l-0` (runtime) | `v4l2` bindgen at build time |
+| relay, shell, files | — | **none** |
+| `screen` (capture) | — | **none** (talks to the X server directly) |
+| `input` (injection) | — | **none** |
+| `webcam` | `libclang-dev` (v4l2 bindgen) | **none** |
+
+Nothing links against `libxcb`, `libX11`, `libdbus`, `libxdo` or `libv4l` — see
+"Using it without building" below for why that matters.
+
+### Fully static build
+
+```bash
+rustup target add x86_64-unknown-linux-musl
+cargo build --release --target x86_64-unknown-linux-musl   # ~3.9 MB, zero deps
+```
 
 Feature flags are independent:
 
@@ -49,25 +59,34 @@ cargo build --no-default-features                            # relay-only
 
 ### Using it without building
 
-Prebuilt x86-64 binaries are in [`artifacts/`](artifacts/):
+A single prebuilt binary is in [`artifacts/`](artifacts/):
+`reaven-0.2.0-linux-x86_64`, 3.9 MB, **statically linked**.
 
-| File | Use |
-|---|---|
-| `reaven-0.2.0-linux-x86_64` | full build (relay + screen + webcam + input) |
-| `reaven-0.2.0-relay-linux-x86_64-static` | relay only, statically linked, zero runtime deps (VPS/minimal server) |
+```bash
+chmod +x artifacts/reaven-0.2.0-linux-x86_64
+./artifacts/reaven-0.2.0-linux-x86_64 server --listen 0.0.0.0:7331 --password 'secret'
+```
 
-**Runtime packages: none.** The full binary links only `libc`, `libm`, `libgcc_s`,
-`libxcb1` and `libdbus-1`, all of which every desktop install already has.
-No libxdo, no libpipewire, no libv4l at runtime. Two caveats — the full binary
-needs **glibc 2.39+** (Debian 13 / Ubuntu 24.10+), and it will not even start on
-a bare server lacking `libdbus-1-3`/`libxcb1`, which is what the static relay
-build is for. Full details: [docs/RUNTIME.md](docs/RUNTIME.md).
+**No packages to install, and no library can be missing.** It is not linked
+against `libxcb`, `libX11`, `libdbus`, `libxdo` or `libv4l`, and it does not
+depend on a particular glibc version, so it runs as-is on Debian, Ubuntu, Fedora,
+RHEL, Alpine, or a bare container. Details: [docs/RUNTIME.md](docs/RUNTIME.md).
+
+**Command-line use never requires X11.** The relay, `exec`, `cl`, upload and
+download run on a headless server with no display and no X libraries installed.
+Commands that genuinely need a screen (`screenshot`, `screen`, `webcam`) fail with
+a sentence telling you what is missing, instead of preventing the binary from
+starting.
 
 **Platform support:** Linux/X11 is what the test suite runs against and is the
 only combination verified end-to-end. Windows and macOS compile through the same
-`xcap`/`enigo`/`nokhwa` backends but are **untested here** — treat them as
-experimental. Wayland capture goes through the portal; Wayland input injection
-depends on compositor support for `libei` and may be refused.
+`enigo`/`nokhwa` backends but are **untested here** — treat them as experimental.
+
+**Wayland:** capture and control go through XWayland, so they work for X11
+applications, which is most of them, but a native Wayland window may not appear
+in the capture and cannot be clicked. For native-Wayland capture you would need a
+`xdg-desktop-portal`/PipeWire backend, which this build does not include (it is
+what previously dragged in `libdbus`/`libxcb`).
 
 ---
 
@@ -324,7 +343,7 @@ android/          Kotlin/Compose operator app (+ prebuilt debug APK)
 docs/PROTOCOL.md  frame reference
 docs/ANDROID.md   app architecture, verified toolchain, limitations
 docs/RUNTIME.md   runtime requirements (what to install to *use* it)
-artifacts/        prebuilt binaries
+artifacts/        prebuilt binary (static, zero runtime deps)
 scripts/demo.sh   runs the whole stack locally on a virtual display
 tests/            unit, end-to-end, protocol-simulation and browser checks
 ```
