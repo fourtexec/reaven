@@ -140,6 +140,33 @@ step "recording frames to disk"
 COUNT=$(ls "$OUT/frames" 2>/dev/null | wc -l)
 [ "$COUNT" -gt 3 ] && ok "recorded $COUNT frames" || bad "expected >3 recorded frames, got $COUNT"
 
+step "invisible footprint: watching a screen draws nothing on it"
+# The agent must never put a banner, border, tray icon, cursor highlight or
+# animation on the watched desktop. Capture is a bare framebuffer read, so assert
+# the window tree and the pixels are identical while a stream is running. This
+# guards against a future change that adds an on-screen overlay.
+if command -v xwininfo >/dev/null && command -v compare >/dev/null; then
+  "$BIN" screenshot --server "$SERVER" --target testpc --quality 95 \
+    --output "$OUT/footprint_before.jpg" >/dev/null 2>&1
+  W_BEFORE=$(xwininfo -root -children 2>/dev/null | grep -c '0x')
+  "$BIN" screen --server "$SERVER" --target testpc --duration 3 --no-viewer --fps 10 \
+    >/dev/null 2>&1 &
+  STREAM_PID=$!
+  sleep 1.2
+  W_DURING=$(xwininfo -root -children 2>/dev/null | grep -c '0x')
+  "$BIN" screenshot --server "$SERVER" --target testpc --quality 95 \
+    --output "$OUT/footprint_during.jpg" >/dev/null 2>&1
+  wait "$STREAM_PID" 2>/dev/null
+  DIFF=$(compare -metric AE "$OUT/footprint_before.jpg" "$OUT/footprint_during.jpg" null: 2>&1 | awk '{print $1}')
+  if [ "$W_BEFORE" = "$W_DURING" ] && [ "$DIFF" = "0" ]; then
+    ok "no window, overlay or pixel change while being watched (windows=$W_BEFORE, diff=$DIFF)"
+  else
+    bad "watching altered the desktop: windows $W_BEFORE->$W_DURING, $DIFF differing pixels"
+  fi
+else
+  echo "    (skipped: needs xwininfo + imagemagick)"
+fi
+
 step "input injection: move pointer to 0.25,0.25 + left click"
 "$BIN" input --server "$SERVER" --target testpc --at 0.25,0.25 --click left 2>&1 | sed 's/^/    /'
 sleep 0.4

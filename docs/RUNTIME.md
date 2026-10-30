@@ -74,6 +74,33 @@ this build does not include — that backend is exactly what used to introduce t
 `libdbus`/`libxcb` dependency. If you need it, the old `xcap` path can be
 restored as an optional feature.
 
+## What the watched machine shows
+
+**Nothing.** There is no banner, border, tray icon, cursor highlight, flash or
+animation when another device views the screen. Capture is a bare framebuffer
+read (`xproto.get_image`) over the X socket, and the agent never creates a
+window, so there is nothing on screen to suppress or turn off — X11 has no
+"someone is capturing" notification for a client to trip in the first place.
+
+This is asserted by the test suite rather than assumed: while a stream is
+running, `tests/e2e.sh` checks that the watched display's window tree and its
+pixels are identical to before (currently `windows=3, diff=0`).
+
+Where an indicator *would* come from:
+
+| Situation | What appears |
+|---|---|
+| X11 or XWayland capture (this build) | nothing |
+| native-Wayland capture via the desktop portal | the compositor's own "screen is being shared" indicator. GNOME and KDE draw it, not the application, and no application can switch it off. This build does not use the portal — see [Wayland](#wayland). |
+| Android | nothing: the app never touches `MediaProjection`, so no cast icon appears on the phone |
+
+One honest limit: this is about the *screen*, not about being undetectable.
+Anyone who can log in to the watched machine can still see that it is being
+accessed — the agent is a process in `ps`, it writes every stream, shell command
+and rejected input to its local log on purpose, and there is traffic to the
+relay. A server you administer should not be a machine that silently watches its
+users, so the log is not something to remove.
+
 ## Android
 
 | Requirement | Value |
