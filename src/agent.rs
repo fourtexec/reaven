@@ -97,6 +97,21 @@ pub async fn run_peer(
         println!("Remote input injection is disabled (view-only).");
     }
 
+    // Probe capture once, at start-up, so a display problem is visible in the
+    // console immediately instead of surfacing as a failed stream later. A
+    // failure is not fatal: shell, files and input still work without a screen.
+    match desktop::self_test() {
+        Ok(report) => {
+            println!("Screen capture self-test:");
+            print!("{report}");
+        }
+        Err(e) => eprintln!(
+            "Screen capture unavailable: {e:#}\n\
+             Shell, file transfer and input still work; screenshots and streaming will fail \
+             until this is fixed."
+        ),
+    }
+
     let (tx, mut rx) = mpsc::unbounded_channel::<Frame>();
     let shells: ShellMap = Arc::new(StdMutex::new(HashMap::new()));
     let streams: StreamMap = Arc::new(StdMutex::new(HashMap::new()));

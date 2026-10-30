@@ -101,6 +101,43 @@ and rejected input to its local log on purpose, and there is traffic to the
 relay. A server you administer should not be a machine that silently watches its
 users, so the log is not something to remove.
 
+## Troubleshooting
+
+### `screen capture failed: the X server refused GetImage …`
+
+The agent asked the X server for the framebuffer and was refused. The message now
+names the rectangle it asked for, the root window size, the depth and the X error,
+which is usually enough to tell these apart:
+
+| X error | Usual cause | Handled how |
+|---|---|---|
+| `BadMatch` | the monitor rectangle does not fit inside the root window: fractional display scaling, mixed-DPI multi-head, or a layout left over from a mode change | the rectangle is clamped to the root; if the direct request still fails, the whole root is captured and the monitor is cropped out of it |
+| `BadValue`/`BadMatch` on a 30-bit deep-colour screen | the plane mask asked for bits past the root depth | retried automatically with a mask sized to the depth |
+| `BadAccess`/`BadDrawable` | another client grabbed the server, or the display was reconfigured mid-request | the stream keeps running; the next frame retries |
+| any error right after the display wakes | DPMS blanking | recovers on the next frame |
+
+A locked screen is rarely the cause on X11 — lockers normally leave the root
+viewable. A Wayland session that does not expose the root pixmap *is* a cause:
+capture there needs XWayland and an X11-managed window, see [Wayland](#wayland).
+
+Every agent now runs a capture self-test at start-up, so this is visible before
+anything goes wrong:
+
+```
+Screen capture self-test:
+  monitor 0 'HDMI-1' 2560x1440 at 0+0 -- capture ok (2560x1440 frame, 184231 bytes JPEG)
+```
+
+A `capture FAILED` line names the monitor that is a problem. It is not fatal:
+shell, file transfer and input keep working, and during a stream repeated identical
+errors are logged once every 10 seconds rather than once per frame.
+
+### Nothing else?
+
+Run `reaven screens` against the agent — it prints exactly what the agent believes
+the display looks like, which is the fastest way to spot a scaling or layout
+mismatch.
+
 ## Android
 
 | Requirement | Value |
