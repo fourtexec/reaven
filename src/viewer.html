@@ -1,0 +1,460 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>__TITLE__ — Reaven</title>
+<style>
+  :root {
+    --bg: #0b0d10;
+    --panel: #14181d;
+    --line: #262d35;
+    --text: #e6edf3;
+    --muted: #8b98a5;
+    --accent: #3fb950;
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body {
+    background: var(--bg); color: var(--text);
+    font: 13px/1.45 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    display: flex; flex-direction: column; overflow: hidden;
+    -webkit-user-select: none; user-select: none;
+  }
+  header {
+    display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+    padding: 8px 12px; background: var(--panel);
+    border-bottom: 1px solid var(--line);
+  }
+  .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); }
+  .dot.live { background: var(--accent); box-shadow: 0 0 8px var(--accent); }
+  .title { font-weight: 600; }
+  .meta { color: var(--muted); }
+  .spacer { flex: 1; }
+  button, input[type=text] {
+    background: #1c2228; color: var(--text); border: 1px solid var(--line);
+    border-radius: 6px; padding: 5px 10px; font: inherit; cursor: pointer;
+  }
+  button:hover { border-color: #3d4753; }
+  button.on { border-color: var(--accent); color: var(--accent); }
+  input[type=text] { cursor: text; }
+  main {
+    flex: 1; position: relative; display: flex; align-items: center;
+    justify-content: center; overflow: hidden; background: #000;
+  }
+  #screen {
+    max-width: 100%; max-height: 100%; display: block;
+    cursor: crosshair; touch-action: none;
+  }
+  body.view #screen { cursor: default; }
+  #hint {
+    position: absolute; inset: auto 0 0 0; padding: 8px 12px;
+    background: linear-gradient(transparent, rgba(0,0,0,.78));
+    color: var(--muted); font-size: 12px; pointer-events: none;
+  }
+  #toast {
+    position: absolute; top: 12px; left: 50%; transform: translateX(-50%);
+    background: #21262d; border: 1px solid var(--line); border-radius: 6px;
+    padding: 6px 12px; opacity: 0; transition: opacity .2s; pointer-events: none;
+  }
+  #toast.show { opacity: 1; }
+  footer {
+    display: flex; align-items: center; gap: 14px; flex-wrap: wrap;
+    padding: 6px 12px; background: var(--panel); border-top: 1px solid var(--line);
+    color: var(--muted); font-size: 12px;
+  }
+  .keys { display: flex; gap: 6px; flex-wrap: wrap; }
+  .keys button { padding: 3px 8px; font-size: 12px; }
+</style>
+</head>
+<body class="__INPUT_MODE__">
+<header>
+  <span class="dot" id="statusDot"></span>
+  <span class="title">__TITLE__</span>
+  <span class="meta">target <strong id="target">__TARGET__</strong></span>
+  <span class="spacer"></span>
+  <span class="meta" id="dims">—</span>
+  <button id="controlToggle">Control: off</button>
+  <button id="snapBtn">Snapshot</button>
+  <button id="fitBtn" class="on">Fit</button>
+</header>
+
+<main>
+  <canvas id="screen"></canvas>
+  <div id="toast"></div>
+  <div id="hint">Click to focus. <strong>C</strong> toggles control mode. Keys go to the remote machine while control is on.</div>
+</main>
+
+<footer>
+  <span id="stats">waiting for frames…</span>
+  <span class="spacer"></span>
+  <div class="keys">
+    <input type="text" id="textInput" placeholder="type text…" size="18">
+    <button id="sendText">Send text</button>
+    <button data-combo="ctrl,alt,t">Ctrl+Alt+T</button>
+    <button data-combo="alt,tab">Alt+Tab</button>
+    <button data-key="Return">Enter</button>
+    <button data-key="Escape">Esc</button>
+  </div>
+</footer>
+
+<script>
+(() => {
+  const view     = document.getElementById('screen');
+  const ctx      = view.getContext('2d');
+  const dims     = document.getElementById('dims');
+  const stats    = document.getElementById('stats');
+  const dot      = document.getElementById('statusDot');
+  const toastEl  = document.getElementById('toast');
+  const toggle   = document.getElementById('controlToggle');
+  const snapBtn  = document.getElementById('snapBtn');
+  const fitBtn   = document.getElementById('fitBtn');
+  const textInput= document.getElementById('textInput');
+  const sendText = document.getElementById('sendText');
+
+  const canControl = document.body.classList.contains('control');
+  let control = false;
+  let dragging = null;
+  let frames = 0, lastCount = 0, lastTs = performance.now(), lastFrameAt = 0;
+  let frameW = 0, frameH = 0, actualSize = false;
+  const pending = [];
+  let flushQueued = false, lastMove = 0;
+
+  // ---- toast --------------------------------------------------------------
+  function toast(msg) {
+    toastEl.textContent = msg;
+    toastEl.classList.add('show');
+    clearTimeout(toast._t);
+    toast._t = setTimeout(() => toastEl.classList.remove('show'), 1600);
+  }
+
+  // ---- input transport ----------------------------------------------------
+  function enqueue(ev) { pending.push(ev); flush(); }
+
+  function flush() {
+    if (flushQueued || !pending.length) return;
+    flushQueued = true;
+    requestAnimationFrame(async () => {
+      flushQueued = false;
+      const batch = pending.splice(0, pending.length);
+      try {
+        const res = await fetch('/input', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(batch)
+        });
+        if (!res.ok) throw new Error(await res.text());
+      } catch (e) {
+        toast('input failed: ' + e.message);
+      }
+      if (pending.length) flush();
+    });
+  }
+
+  function setControl(on) {
+    control = on && canControl;
+    toggle.textContent = 'Control: ' + (control ? 'ON' : 'off');
+    toggle.classList.toggle('on', control);
+    document.body.classList.toggle('view', !control);
+  }
+  toggle.addEventListener('click', () => {
+    if (!canControl) return toast('this agent is view-only');
+    setControl(!control);
+  });
+  document.addEventListener('keydown', (e) => {
+    if (e.key.toLowerCase() === 'c' && !e.ctrlKey && !e.altKey &&
+        document.activeElement !== textInput && !control && canControl) {
+      setControl(true);
+      e.preventDefault();
+    }
+  });
+
+  // ---- coordinates --------------------------------------------------------
+  // Normalised against the *displayed* canvas rect, which is exactly the
+  // letterboxed image because we size the element ourselves in layout().
+  function norm(e) {
+    const r = view.getBoundingClientRect();
+    if (!r.width || !r.height) return { x: 0.5, y: 0.5 };
+    return {
+      x: Math.min(1, Math.max(0, (e.clientX - r.left) / r.width)),
+      y: Math.min(1, Math.max(0, (e.clientY - r.top) / r.height))
+    };
+  }
+  const buttonName = (b) => b === 2 ? 'right' : b === 1 ? 'middle' : 'left';
+
+  view.addEventListener('mousedown', (e) => {
+    if (!control) return;
+    e.preventDefault();
+    const p = norm(e);
+    dragging = buttonName(e.button);
+    enqueue({ event: 'down', button: dragging, x: p.x, y: p.y });
+  });
+
+  view.addEventListener('mousemove', (e) => {
+    if (!control) return;
+    const p = norm(e);
+    const now = performance.now();
+    if (dragging) {
+      enqueue({ event: 'move', x: p.x, y: p.y });
+    } else if (now - lastMove > 33) {
+      lastMove = now;
+      enqueue({ event: 'move', x: p.x, y: p.y });
+    }
+  });
+
+  window.addEventListener('mouseup', (e) => {
+    if (!control || !dragging) return;
+    const p = norm(e);
+    enqueue({ event: 'up', button: dragging, x: p.x, y: p.y });
+    dragging = null;
+  });
+
+  view.addEventListener('contextmenu', (e) => { if (control) e.preventDefault(); });
+
+  view.addEventListener('wheel', (e) => {
+    if (!control) return;
+    e.preventDefault();
+    const p = norm(e);
+    const step = Math.max(1, Math.round(Math.abs(e.deltaY) / 100));
+    enqueue({ event: 'scroll', x: p.x, y: p.y, dx: 0, dy: e.deltaY > 0 ? step : -step });
+  }, { passive: false });
+
+  // Touch: one finger drags the pointer, tap clicks, two-finger drag scrolls.
+  let touchState = null;
+  view.addEventListener('touchstart', (e) => {
+    if (!control) return;
+    e.preventDefault();
+    if (e.touches.length === 1) {
+      const p = norm(e.touches[0]);
+      touchState = { mode: 'drag', start: p, moved: false };
+      enqueue({ event: 'down', button: 'left', x: p.x, y: p.y });
+    } else if (e.touches.length === 2) {
+      touchState = { mode: 'scroll', lastY: e.touches[0].clientY };
+    }
+  }, { passive: false });
+
+  view.addEventListener('touchmove', (e) => {
+    if (!control || !touchState) return;
+    e.preventDefault();
+    if (touchState.mode === 'drag') {
+      const p = norm(e.touches[0]);
+      if (Math.abs(p.x - touchState.start.x) > 0.004 || Math.abs(p.y - touchState.start.y) > 0.004) {
+        touchState.moved = true;
+      }
+      enqueue({ event: 'move', x: p.x, y: p.y });
+    } else {
+      const dy = e.touches[0].clientY - touchState.lastY;
+      if (Math.abs(dy) > 24) {
+        const p = norm(e.touches[0]);
+        enqueue({ event: 'scroll', x: p.x, y: p.y, dx: 0, dy: dy > 0 ? 2 : -2 });
+        touchState.lastY = e.touches[0].clientY;
+      }
+    }
+  }, { passive: false });
+
+  view.addEventListener('touchend', (e) => {
+    if (!control || !touchState) return;
+    e.preventDefault();
+    if (touchState.mode === 'drag') {
+      const p = norm(e.changedTouches[0]);
+      enqueue({ event: 'up', button: 'left', x: p.x, y: p.y });
+    }
+    touchState = null;
+  }, { passive: false });
+
+  // ---- keyboard -----------------------------------------------------------
+  const NAMED = {
+    'Enter': 'Return', ' ': 'space', 'Backspace': 'backspace', 'Tab': 'tab',
+    'Escape': 'escape', 'Delete': 'delete', 'ArrowUp': 'up', 'ArrowDown': 'down',
+    'ArrowLeft': 'left', 'ArrowRight': 'right', 'Home': 'home', 'End': 'end',
+    'PageUp': 'pageup', 'PageDown': 'pagedown', 'CapsLock': 'capslock',
+    'Control': 'ctrl', 'Shift': 'shift', 'Alt': 'alt', 'Meta': 'meta'
+  };
+  function keyName(e) {
+    if (NAMED[e.key]) return NAMED[e.key];
+    if (/^F\d{1,2}$/.test(e.key)) return e.key.toLowerCase();
+    if (e.key.length === 1) return e.key;
+    return null;
+  }
+
+  document.addEventListener('keydown', (e) => {
+    if (!control) return;
+    if (document.activeElement === textInput && e.key !== 'Escape') return;
+    const name = keyName(e);
+    if (!name) return;
+    e.preventDefault();
+    enqueue({ event: 'key', key: name, pressed: true });
+    enqueue({ event: 'key', key: name, pressed: false });
+  });
+
+  sendText.addEventListener('click', () => {
+    if (!canControl) return toast('view-only');
+    const text = textInput.value;
+    if (!text) return;
+    enqueue({ event: 'text', text });
+    textInput.value = '';
+    toast('sent ' + text.length + ' chars');
+  });
+  textInput.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') { e.preventDefault(); sendText.click(); }
+    e.stopPropagation();
+  });
+
+  document.querySelectorAll('[data-key]').forEach(btn => {
+    btn.addEventListener('click', () => {
+      if (!canControl) return toast('view-only');
+      const k = btn.dataset.key;
+      enqueue({ event: 'key', key: k, pressed: true });
+      enqueue({ event: 'key', key: k, pressed: false });
+    });
+  });
+  document.querySelectorAll('[data-combo]').forEach(btn => {
+    btn.addEventListener('click', () => {
+      if (!canControl) return toast('view-only');
+      enqueue({ event: 'combo', keys: btn.dataset.combo.split(',') });
+    });
+  });
+
+  // ---- layout -------------------------------------------------------------
+  // Size the canvas ourselves so its rect is exactly what the pointer maps to.
+  function layout() {
+    if (!frameW || !frameH) return;
+    const parent = view.parentElement.getBoundingClientRect();
+    if (actualSize) {
+      view.style.width = frameW + 'px';
+      view.style.height = frameH + 'px';
+      return;
+    }
+    const scale = Math.min(parent.width / frameW, parent.height / frameH);
+    view.style.width = Math.max(1, Math.floor(frameW * scale)) + 'px';
+    view.style.height = Math.max(1, Math.floor(frameH * scale)) + 'px';
+  }
+
+  window.addEventListener('resize', layout);
+
+  fitBtn.addEventListener('click', () => {
+    actualSize = !fitBtn.classList.contains('on');
+    if (actualSize) {
+      fitBtn.classList.remove('on');
+      fitBtn.textContent = 'Actual';
+      view.parentElement.style.overflow = 'auto';
+    } else {
+      fitBtn.classList.add('on');
+      fitBtn.textContent = 'Fit';
+      view.parentElement.style.overflow = 'hidden';
+    }
+    layout();
+  });
+
+  // ---- MJPEG pump ---------------------------------------------------------
+  // fetch() + <canvas> rather than <img src="/stream.mjpg">: browsers do not
+  // reliably fire a per-part `load` event, which leaves you with no frame
+  // count, no fps, and no way to tell a frozen stream from a still desktop.
+  const decoder = new TextDecoder();
+
+  function indexOfBytes(haystack, needle, from = 0) {
+    const n = needle.length;
+    outer: for (let i = from; i <= haystack.length - n; i++) {
+      for (let j = 0; j < n; j++) if (haystack[i + j] !== needle.charCodeAt(j)) continue outer;
+      return i;
+    }
+    return -1;
+  }
+
+  function concatBytes(a, b) {
+    const out = new Uint8Array(a.length + b.length);
+    out.set(a); out.set(b, a.length);
+    return out;
+  }
+
+  function takePart(buf) {
+    const boundary = '--reavenframe';
+    const bIdx = indexOfBytes(buf, boundary);
+    if (bIdx < 0) return null;
+    const headerEnd = indexOfBytes(buf, '\r\n\r\n', bIdx);
+    if (headerEnd < 0) return null;
+    const header = decoder.decode(buf.subarray(bIdx, headerEnd));
+    const m = /content-length:\s*(\d+)/i.exec(header);
+    if (!m) return null;
+    const len = parseInt(m[1], 10);
+    const start = headerEnd + 4;
+    if (buf.length < start + len) return null;
+    return { jpeg: buf.slice(start, start + len), rest: buf.slice(start + len) };
+  }
+
+  async function drawFrame(bytes) {
+    const bitmap = await createImageBitmap(new Blob([bytes], { type: 'image/jpeg' }));
+    if (view.width !== bitmap.width || view.height !== bitmap.height) {
+      view.width = bitmap.width;
+      view.height = bitmap.height;
+      frameW = bitmap.width;
+      frameH = bitmap.height;
+      layout();
+      dims.textContent = frameW + '×' + frameH;
+    }
+    ctx.drawImage(bitmap, 0, 0);
+    bitmap.close();
+  }
+
+  async function pump() {
+    while (true) {
+      try {
+        const res = await fetch('/stream.mjpg?t=' + Date.now(), { cache: 'no-store' });
+        if (!res.ok || !res.body) throw new Error('HTTP ' + res.status);
+        const reader = res.body.getReader();
+        let buf = new Uint8Array(0);
+        while (true) {
+          const { value, done } = await reader.read();
+          if (done) break;
+          buf = concatBytes(buf, value);
+          let part;
+          while ((part = takePart(buf))) {
+            buf = part.rest;
+            await drawFrame(part.jpeg);
+            frames++;
+            lastFrameAt = performance.now();
+            dot.classList.add('live');
+          }
+        }
+      } catch (e) {
+        dot.classList.remove('live');
+        stats.textContent = 'stream error: ' + e.message + ' — reconnecting…';
+      }
+      await new Promise((r) => setTimeout(r, 1200));
+    }
+  }
+
+  setInterval(() => {
+    const now = performance.now();
+    const fps = (frames - lastCount) / ((now - lastTs) / 1000);
+    lastCount = frames; lastTs = now;
+    const stalled = lastFrameAt && now - lastFrameAt > 3000;
+    if (stalled) dot.classList.remove('live');
+    stats.textContent = fps.toFixed(1) + ' fps · ' +
+      (frameW ? frameW + '×' + frameH : '—') +
+      ' · ' + (control ? 'control ON' : 'view only') +
+      (stalled ? ' · STALLED' : '');
+  }, 1000);
+
+  // ---- snapshot -----------------------------------------------------------
+  snapBtn.addEventListener('click', async () => {
+    try {
+      const res = await fetch('/snapshot.jpg?t=' + Date.now());
+      if (!res.ok) throw new Error(await res.text());
+      const blob = await res.blob();
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = 'reaven-' + new Date().toISOString().replace(/[:.]/g, '-') + '.jpg';
+      a.click();
+      setTimeout(() => URL.revokeObjectURL(url), 5000);
+      toast('snapshot saved');
+    } catch (e) { toast('snapshot failed: ' + e.message); }
+  });
+
+  if (!canControl) { toggle.disabled = true; toggle.textContent = 'view only'; }
+  pump();
+})();
+</script>
+</body>
+</html>

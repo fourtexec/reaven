@@ -1,12 +1,21 @@
 [package]
 name = "reaven"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
-description = "A small server-relayed remote administration CLI"
+description = "Server-relayed remote administration: shell, files, screen streaming, webcam and input control"
+license = "MIT"
 
 [[bin]]
 name = "reaven"
 path = "src/main.rs"
+
+[features]
+# Everything on by default. Turn features off for a smaller/headless build,
+# e.g. `cargo build --no-default-features --features screen,input`.
+default = ["screen", "input", "webcam"]
+screen = ["dep:x11rb", "dep:image", "dep:jpeg-encoder"]
+webcam = ["dep:nokhwa", "dep:image", "dep:jpeg-encoder"]
+input = ["dep:enigo"]
 
 [dependencies]
 anyhow = "1"
@@ -18,3 +27,16 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["full"] }
 uuid = { version = "=1.11.0", features = ["v4"] }
+
+# --- desktop capture / injection (feature-gated) ---
+# Pure-Rust X11 client: links no C libraries, so a missing libxcb or
+# libdbus can never stop the binary from starting.
+x11rb = { version = "0.13", optional = true, default-features = false, features = ["randr"] }
+enigo = { version = "0.6", optional = true }
+nokhwa = { version = "0.10", optional = true, default-features = false, features = ["input-native"] }
+image = { version = "0.25", optional = true, default-features = false, features = ["png", "jpeg"] }
+jpeg-encoder = { version = "0.6", optional = true }
+
+[profile.release]
+lto = "thin"
+strip = true
