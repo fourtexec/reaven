@@ -44,9 +44,9 @@ jobs:
       shell: bash
       run: |
         if [ "${{ matrix.os }}" = "windows-latest" ]; then
-          mv target/${{ matrix.target }}/release/my_app.exe ./${{ matrix.artifact_name }}
+          mv target/${{ matrix.target }}/release/reaven.exe ./${{ matrix.artifact_name }}
         else
-          mv target/${{ matrix.target }}/release/my_app ./${{ matrix.artifact_name }}
+          mv target/${{ matrix.target }}/release/reaven ./${{ matrix.artifact_name }}
         fi
 
     - name: Upload to GitHub Release
