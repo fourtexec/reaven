@@ -31,11 +31,14 @@ run "android client protocol" xvfb-run -a -s "-screen 0 1440x900x24" \
 if command -v chromium >/dev/null && python3 -c "import websocket" 2>/dev/null; then
   printf '\n\033[1m=== viewer in a real browser\033[0m\n'
   export REAVEN_PASSWORD=browser-check
+  # Local relay uses a throwaway self-signed certificate; all test clients
+  # (agent, screen operator) must accept it.
+  export REAVEN_INSECURE=true
   PORT=${REAVEN_BROWSER_PORT:-7465}
   Xvfb :88 -screen 0 1200x700x24 >/dev/null 2>&1 & XPID=$!
   sleep 1
   DISPLAY=:88 ./target/debug/reaven server --listen "127.0.0.1:$PORT" \
-      --password "$REAVEN_PASSWORD" >/dev/null 2>&1 & RPID=$!
+      --password "$REAVEN_PASSWORD" --self-signed >/dev/null 2>&1 & RPID=$!
   sleep 0.7
   DISPLAY=:88 ./target/debug/reaven connect --server "127.0.0.1:$PORT" --name pc \
       >/dev/null 2>&1 & APID=$!

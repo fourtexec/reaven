@@ -1,49 +1,49 @@
 package dev.reaven.control.data
 
+import android.annotation.SuppressLint
 import kotlinx.coroutines.CompletableDeferred
-import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.Job
-import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.channels.BufferOverflow
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.StateFlow
-import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.asSharedFlow
+import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.first
-import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
+import okhttp3.OkHttpClient
+import okhttp3.Request
+import okhttp3.Response
+import okhttp3.WebSocket
+import okhttp3.WebSocketListener
 import org.json.JSONArray
 import org.json.JSONObject
-import java.io.BufferedWriter
 import java.io.IOException
-import java.io.OutputStreamWriter
-import java.net.InetSocketAddress
-import java.net.Socket
+import java.security.SecureRandom
+import java.security.cert.X509Certificate
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.TimeUnit
+import javax.net.ssl.SSLContext
+import javax.net.ssl.TrustManager
+import javax.net.ssl.X509TrustManager
 
 /**
- * A single operator connection to a Reaven relay.
+ * A single operator connection to a Reaven relay over secure WebSocket (WSS).
  *
- * One socket carries everything: request/response traffic, video frames and
- * shell output. Frames are dispatched to the right place by their `type` tag,
- * and request responses are matched by id on [CompletableDeferred]s.
+ * One connection carries everything: request/response traffic, video frames and
+ * shell output. Every WebSocket text message is one JSON frame, dispatched by
+ * its `type` tag; request responses are matched by id on [CompletableDeferred]s.
  */
 class ReavenClient {
 
-    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
-
-    private var socket: Socket? = null
-    private var writer: BufferedWriter? = null
-    private var readerJob: Job? = null
-    private var welcome: CompletableDeferred<Result<Unit>>? = null
-
     private val pendingRequests = ConcurrentHashMap<String, CompletableDeferred<Incoming.Response>>()
     private val pendingPeers = ConcurrentHashMap<String, CompletableDeferred<List<PeerInfo>>>()
+
+    @Volatile
+    private var webSocket: WebSocket? = null
 
     private val _status = MutableStateFlow("not connected")
     val status: StateFlow<String> = _status.asStateFlow()
@@ -78,80 +78,93 @@ class ReavenClient {
         host: String,
         port: Int,
         password: String?,
-        name: String
+        name: String,
+        insecure: Boolean = false
     ): Result<Unit> = withContext(Dispatchers.IO) {
         runCatching {
             disconnect()
-            val s = Socket()
-            s.tcpNoDelay = true
-            s.connect(InetSocketAddress(host, port), 8_000)
-            socket = s
-            writer = BufferedWriter(OutputStreamWriter(s.getOutputStream(), Charsets.UTF_8))
             val signal = CompletableDeferred<Result<Unit>>()
-            welcome = signal
-            readerJob = scope.launch { readLoop(s, signal) }
-            sendFrame(Protocol.hello(name, password))
+            val client = if (insecure) insecureHttpClient() else baseHttpClient
+            val request = Request.Builder()
+                .url("wss://$host:$port/ws")
+                .build()
+            val socket = client.newWebSocket(request, object : WebSocketListener() {
+                override fun onOpen(webSocket: WebSocket, response: Response) {
+                    runCatching {
+                        webSocket.send(encodeFrame(Protocol.hello(name, password)))
+                    }.onFailure {
+                        signal.complete(Result.failure(IOException(it.message ?: "send failed")))
+                    }
+                }
+
+                override fun onMessage(webSocket: WebSocket, text: String) {
+                    handleFrame(text, signal)
+                }
+
+                override fun onClosing(webSocket: WebSocket, code: Int, reason: String) {
+                    webSocket.close(1000, null)
+                }
+
+                override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
+                    signal.complete(Result.failure(IOException("connection closed")))
+                    _status.value = "disconnected"
+                }
+
+                override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
+                    signal.complete(
+                        Result.failure(IOException(t.message ?: "connection failed"))
+                    )
+                    _status.value = "connect failed: ${t.message}"
+                }
+            })
+            webSocket = socket
             withTimeout(10_000) { signal.await() }.getOrThrow()
-            _status.value = "connected to $host:$port"
+            _status.value = "connected to $host:$port (WSS)"
         }.onFailure {
             _status.value = "connect failed: ${it.message}"
             closeQuietly()
         }
     }
 
-    private suspend fun readLoop(s: Socket, signal: CompletableDeferred<Result<Unit>>) {
-        try {
-            val reader = s.getInputStream().bufferedReader(Charsets.UTF_8)
-            while (true) {
-                val line = reader.readLine() ?: break
-                if (line.isBlank()) continue
-                when (val frame = Protocol.parse(line)) {
-                    null -> Unit
-                    is Incoming.Welcome -> signal.complete(Result.success(Unit))
-                    is Incoming.ServerError -> {
-                        signal.complete(Result.failure(IOException(frame.message)))
-                        _status.value = "server error: ${frame.message}"
-                    }
-                    is Incoming.Response -> pendingRequests.remove(frame.id)?.complete(frame)
-                    is Incoming.PeerList -> pendingPeers.remove(frame.id)?.complete(frame.peers)
-                    is Incoming.VideoFrame -> {
-                        if (frame.id == currentStreamId) _videoFrames.tryEmit(frame)
-                    }
-                    is Incoming.VideoError -> _videoErrors.tryEmit(frame.message)
-                    is Incoming.VideoStop -> _videoErrors.tryEmit("stream ended")
-                    is Incoming.ShellOutput -> _shellOutput.tryEmit(frame.data)
-                    is Incoming.ShellExit -> _shellExit.tryEmit(frame.code)
-                }
+    private fun handleFrame(text: String, signal: CompletableDeferred<Result<Unit>>) {
+        when (val frame = Protocol.parse(text)) {
+            null -> Unit
+            is Incoming.Welcome -> signal.complete(Result.success(Unit))
+            is Incoming.ServerError -> {
+                signal.complete(Result.failure(IOException(frame.message)))
+                _status.value = "server error: ${frame.message}"
             }
-        } catch (e: Exception) {
-            if (e !is java.io.InterruptedIOException) {
-                _status.value = "disconnected: ${e.message}"
+            is Incoming.Response -> pendingRequests.remove(frame.id)?.complete(frame)
+            is Incoming.PeerList -> pendingPeers.remove(frame.id)?.complete(frame.peers)
+            is Incoming.VideoFrame -> {
+                if (frame.id == currentStreamId) _videoFrames.tryEmit(frame)
             }
-        } finally {
-            signal.complete(Result.failure(IOException("connection closed")))
-            _status.value = "disconnected"
+            is Incoming.VideoError -> _videoErrors.tryEmit(frame.message)
+            is Incoming.VideoStop -> _videoErrors.tryEmit("stream ended")
+            is Incoming.ShellOutput -> _shellOutput.tryEmit(frame.data)
+            is Incoming.ShellExit -> _shellExit.tryEmit(frame.code)
         }
     }
 
+    private fun encodeFrame(json: JSONObject): String = json.toString()
+
     private fun sendFrame(json: JSONObject) {
-        val out = writer ?: throw IOException("not connected")
+        val socket = webSocket ?: throw IOException("not connected")
         synchronized(this) {
-            out.write(json.toString())
-            out.write("\n")
-            out.flush()
+            if (!socket.send(encodeFrame(json))) {
+                throw IOException("connection closed")
+            }
         }
     }
 
     fun closeQuietly() {
-        runCatching { readerJob?.cancel() }
         val id = shellId
         val target = shellTarget
         if (id != null && target != null) {
             runCatching { sendFrame(Protocol.shellClose(id, target)) }
         }
-        runCatching { socket?.close() }
-        socket = null
-        writer = null
+        runCatching { webSocket?.close(1000, "bye") }
+        webSocket = null
         currentStreamId = null
         shellId = null
     }
@@ -294,4 +307,30 @@ class ReavenClient {
         withTimeout(timeoutMs) { videoFrames.first() }
 
     private fun newId(): String = UUID.randomUUID().toString()
+
+    private companion object {
+        val baseHttpClient: OkHttpClient by lazy {
+            OkHttpClient.Builder()
+                .connectTimeout(8, TimeUnit.SECONDS)
+                // No read timeout: a screen stream is intentionally long-lived.
+                .readTimeout(0, TimeUnit.MILLISECONDS)
+                .pingInterval(20, TimeUnit.SECONDS)
+                .build()
+        }
+    }
+
+    @SuppressLint("CustomX509TrustManager", "TrustAllX509TrustManager")
+    private fun insecureHttpClient(): OkHttpClient {
+        val trustManager = object : X509TrustManager {
+            override fun checkClientTrusted(chain: Array<out X509Certificate>?, authType: String?) {}
+            override fun checkServerTrusted(chain: Array<out X509Certificate>?, authType: String?) {}
+            override fun getAcceptedIssuers(): Array<X509Certificate> = emptyArray()
+        }
+        val sslContext = SSLContext.getInstance("TLS")
+        sslContext.init(null, arrayOf<TrustManager>(trustManager), SecureRandom())
+        return baseHttpClient.newBuilder()
+            .sslSocketFactory(sslContext.socketFactory, trustManager)
+            .hostnameVerifier { _, _ -> true }
+            .build()
+    }
 }

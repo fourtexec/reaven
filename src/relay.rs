@@ -10,14 +10,12 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
-use tokio::io::BufReader;
-use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, Mutex};
 use tokio::time::timeout;
 
-use crate::protocol::{
-    read_frame, write_frame, Frame, PeerInfo, PeerKind, ResponseResult, PROTOCOL_VERSION,
-};
+use crate::protocol::{Frame, PeerInfo, PeerKind, ResponseResult, PROTOCOL_VERSION};
+use crate::tls::{self, TlsOptions};
+use crate::transport::{self, BoxedIo};
 
 struct PeerEntry {
     tx: mpsc::UnboundedSender<Frame>,
@@ -27,12 +25,14 @@ struct PeerEntry {
 
 type PeerMap = Arc<Mutex<HashMap<String, PeerEntry>>>;
 
-pub async fn run_server(addr: &str, password: Option<String>) -> Result<()> {
-    let listener = TcpListener::bind(addr)
-        .await
-        .with_context(|| format!("binding {addr}"))?;
+pub async fn run_server(
+    addr: &str,
+    password: Option<String>,
+    tls_options: TlsOptions,
+) -> Result<()> {
+    let mut incoming = tls::bind(addr, tls_options).await?;
     println!(
-        "Reaven relay v{} (protocol v{}) listening on {addr}{}",
+        "Reaven relay v{} (protocol v{}) listening on wss://{addr}/ws{}",
         env!("CARGO_PKG_VERSION"),
         PROTOCOL_VERSION,
         if password.is_some() {
@@ -42,31 +42,35 @@ pub async fn run_server(addr: &str, password: Option<String>) -> Result<()> {
         }
     );
     let peers: PeerMap = Arc::new(Mutex::new(HashMap::new()));
-    loop {
-        let (stream, remote) = listener.accept().await?;
+    while let Some(stream) = incoming.recv().await {
         let map = peers.clone();
         let pass = password.clone();
         tokio::spawn(async move {
             if let Err(e) = serve_connection(stream, map, pass).await {
-                eprintln!("{remote}: {e:#}");
+                let message = format!("{e:#}");
+                // Normal disconnects (including rustls' close_notify warning on
+                // abrupt client exits) are not worth logging on a busy relay.
+                if !message.contains("connection closed")
+                    && !message.contains("close_notify")
+                    && !message.contains("Connection reset")
+                {
+                    eprintln!("{message}");
+                }
             }
         });
     }
+    Ok(())
 }
 
 async fn send_to(peers: &PeerMap, name: &str) -> Option<mpsc::UnboundedSender<Frame>> {
     peers.lock().await.get(name).map(|p| p.tx.clone())
 }
 
-async fn serve_connection(
-    stream: TcpStream,
-    peers: PeerMap,
-    password: Option<String>,
-) -> Result<()> {
-    let (read, mut write) = stream.into_split();
-    let mut reader = BufReader::new(read);
+async fn serve_connection(stream: BoxedIo, peers: PeerMap, password: Option<String>) -> Result<()> {
+    let ws = transport::accept(stream).await?;
+    let (mut reader, mut write) = ws.split();
 
-    let (name, kind, mut info) = match timeout(Duration::from_secs(10), read_frame(&mut reader))
+    let (name, kind, mut info) = match timeout(Duration::from_secs(10), reader.recv())
         .await
         .context("waiting for hello")??
     {
@@ -77,13 +81,11 @@ async fn serve_connection(
             info,
         } => {
             if password != supplied {
-                write_frame(
-                    &mut write,
-                    &Frame::Error {
+                write
+                    .send(&Frame::Error {
                         message: "authentication failed".into(),
-                    },
-                )
-                .await?;
+                    })
+                    .await?;
                 bail!("authentication failed");
             }
             if name.trim().is_empty() {
@@ -125,10 +127,10 @@ async fn serve_connection(
         );
     }
 
-    write_frame(&mut write, &Frame::Welcome).await?;
+    write.send(&Frame::Welcome).await?;
     let writer = tokio::spawn(async move {
         while let Some(frame) = rx.recv().await {
-            if write_frame(&mut write, &frame).await.is_err() {
+            if write.send(&frame).await.is_err() {
                 break;
             }
         }
@@ -136,7 +138,7 @@ async fn serve_connection(
 
     let loop_result: Result<()> = async {
         loop {
-            let frame = read_frame(&mut reader).await?;
+            let frame = reader.recv().await?;
             match frame {
                 Frame::Request { id, target, op, .. } => match send_to(&peers, &target).await {
                     Some(dest) => {

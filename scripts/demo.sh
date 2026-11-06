@@ -19,6 +19,8 @@ command -v Xvfb >/dev/null || { echo "install xvfb to run the demo"; exit 1; }
 PORT=${REAVEN_DEMO_PORT:-7431}
 PASS=demo-password
 export REAVEN_PASSWORD=$PASS
+# The demo relay uses a throwaway self-signed certificate on loopback.
+export REAVEN_INSECURE=true
 
 cleanup() {
   [ "$KEEP" = "1" ] && return
@@ -39,8 +41,8 @@ if command -v xterm >/dev/null; then
   PIDS+=($!)
 fi
 
-echo "→ starting relay on 127.0.0.1:$PORT"
-"$BIN" server --listen "127.0.0.1:$PORT" --password "$PASS" &
+echo "→ starting WSS relay on 127.0.0.1:$PORT"
+"$BIN" server --listen "127.0.0.1:$PORT" --password "$PASS" --self-signed &
 PIDS+=($!)
 sleep 0.7
 
@@ -54,6 +56,7 @@ echo "→ online machines:"
 
 echo
 echo "Try, in another shell:"
+echo "  export REAVEN_INSECURE=true"
 echo "  export REAVEN_PASSWORD=$PASS"
 echo "  reaven screenshot --server 127.0.0.1:$PORT --target demo-pc --output demo.jpg"
 echo "  reaven input --server 127.0.0.1:$PORT --target demo-pc --at 0.5,0.5 --click left"

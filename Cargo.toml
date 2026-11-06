@@ -28,6 +28,21 @@ serde_json = "1"
 tokio = { version = "1", features = ["full"] }
 uuid = { version = "=1.11.0", features = ["v4"] }
 
+# --- WSS transport (TLS + WebSocket) ---
+futures-util = { version = "0.3", features = ["sink"] }
+tokio-stream = { version = "0.1", features = ["net"] }
+tokio-tungstenite = { version = "0.30", default-features = false, features = ["connect", "handshake", "rustls-tls-webpki-roots"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+rustls-pemfile = "2"
+
+# Automatic Let's Encrypt certificates (TLS-ALPN-01) and local self-signed certs.
+rustls-acme = { version = "0.15", default-features = false, features = ["ring", "tls12", "tokio", "webpki-roots"] }
+rcgen = { version = "0.13", default-features = false, features = ["ring"] }
+webpki-roots = "0.26"
+log = "0.4"
+env_logger = "0.11"
+
 # --- desktop capture / injection (feature-gated) ---
 # Pure-Rust X11 client: links no C libraries, so a missing libxcb or
 # libdbus can never stop the binary from starting.

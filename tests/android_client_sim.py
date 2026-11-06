@@ -13,6 +13,8 @@ import base64
 import json
 import os
 import socket
+import ssl
+import struct
 import subprocess
 import sys
 import tempfile
@@ -34,28 +36,101 @@ def check(name, ok, detail=""):
 
 
 class Client:
-    """Mirrors dev.reaven.control.data.ReavenClient."""
+    """Mirrors dev.reaven.control.data.ReavenClient over WSS.
+
+    Deliberately implements the small WebSocket subset the relay uses (one
+    JSON object per text message) so the test has no third-party dependency.
+    """
 
     def __init__(self, host, port, password, name="android"):
-        self.sock = socket.create_connection((host, port), timeout=10)
-        self.sock.settimeout(20)
+        raw = socket.create_connection((host, port), timeout=10)
+        raw.settimeout(20)
+        context = ssl.create_default_context()
+        context.check_hostname = False
+        context.verify_mode = ssl.CERT_NONE
+        self.sock = context.wrap_socket(raw, server_hostname=host)
         self.buf = b""
+        self._handshake(host, port)
         self.send({"type": "hello", "name": name, "password": password,
                    "kind": "operator", "info": None})
         frame = self.recv()
         assert frame.get("type") == "welcome", f"expected welcome, got {frame}"
 
-    def send(self, obj):
-        self.sock.sendall(json.dumps(obj).encode() + b"\n")
+    def _handshake(self, host, port):
+        key = base64.b64encode(os.urandom(16)).decode()
+        request = (
+            "GET /ws HTTP/1.1\r\n"
+            f"Host: {host}:{port}\r\n"
+            "Upgrade: websocket\r\n"
+            "Connection: Upgrade\r\n"
+            f"Sec-WebSocket-Key: {key}\r\n"
+            "Sec-WebSocket-Version: 13\r\n\r\n"
+        )
+        self.sock.sendall(request.encode())
+        while b"\r\n\r\n" not in self.buf:
+            chunk = self.sock.recv(4096)
+            if not chunk:
+                raise ConnectionError("relay closed during WebSocket handshake")
+            self.buf += chunk
+        head, self.buf = self.buf.split(b"\r\n\r\n", 1)
+        status = head.split(b"\r\n", 1)[0]
+        if b" 101 " not in status:
+            raise ConnectionError(f"WebSocket upgrade failed: {status!r}")
 
-    def recv(self):
-        while b"\n" not in self.buf:
+    def _read_exact(self, count):
+        while len(self.buf) < count:
             chunk = self.sock.recv(1 << 16)
             if not chunk:
                 raise ConnectionError("relay closed the connection")
             self.buf += chunk
-        line, self.buf = self.buf.split(b"\n", 1)
-        return json.loads(line)
+        data, self.buf = self.buf[:count], self.buf[count:]
+        return data
+
+    def _send_frame(self, opcode, payload):
+        mask = os.urandom(4)
+        header = bytearray([0x80 | opcode])
+        length = len(payload)
+        if length < 126:
+            header.append(0x80 | length)
+        elif length < 65536:
+            header.append(0x80 | 126)
+            header += struct.pack(">H", length)
+        else:
+            header.append(0x80 | 127)
+            header += struct.pack(">Q", length)
+        header += mask
+        masked = bytes(byte ^ mask[index % 4] for index, byte in enumerate(payload))
+        self.sock.sendall(bytes(header) + masked)
+
+    def _recv_frame(self):
+        while True:
+            first, second = self._read_exact(2)
+            opcode = first & 0x0F
+            masked = bool(second & 0x80)
+            length = second & 0x7F
+            if length == 126:
+                length = struct.unpack(">H", self._read_exact(2))[0]
+            elif length == 127:
+                length = struct.unpack(">Q", self._read_exact(8))[0]
+            mask = self._read_exact(4) if masked else None
+            payload = self._read_exact(length)
+            if mask:
+                payload = bytes(byte ^ mask[index % 4] for index, byte in enumerate(payload))
+            if opcode == 0x8:
+                raise ConnectionError("relay sent WebSocket close")
+            if opcode == 0x9:
+                self._send_frame(0xA, payload)
+                continue
+            if opcode == 0xA:
+                continue
+            if opcode in (0x1, 0x2):
+                return payload
+
+    def send(self, obj):
+        self._send_frame(0x1, json.dumps(obj).encode())
+
+    def recv(self):
+        return json.loads(self._recv_frame().decode())
 
     def recv_matching(self, predicate, timeout=15):
         deadline = time.time() + timeout
@@ -110,14 +185,15 @@ def main():
     workdir = tempfile.mkdtemp()
     procs = []
     try:
-        print("starting relay + agent")
+        print("starting WSS relay + agent")
         procs.append(subprocess.Popen(
-            [BIN, "server", "--listen", f"127.0.0.1:{PORT}", "--password", PASSWORD],
+            [BIN, "server", "--listen", f"127.0.0.1:{PORT}", "--password", PASSWORD,
+             "--self-signed"],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL))
         wait_port()
         procs.append(subprocess.Popen(
             [BIN, "connect", "--server", f"127.0.0.1:{PORT}", "--name", "testpc"],
-            env={**os.environ, "REAVEN_PASSWORD": PASSWORD},
+            env={**os.environ, "REAVEN_PASSWORD": PASSWORD, "REAVEN_INSECURE": "true"},
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL))
         time.sleep(1.2)
 

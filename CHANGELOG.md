@@ -1,5 +1,56 @@
 # Changelog
 
+## Unreleased — WSS transport and automatic TLS
+
+### Added
+- **WSS transport.** Relay, agents, CLI operators and the Android app now speak
+  TLS-protected WebSocket instead of plaintext TCP. One JSON frame is one
+  WebSocket text message; ping/pong and close are handled at the transport layer.
+  `MAX_FRAME_BYTES` (32 MB) is enforced at both the protocol and WebSocket layers.
+  Implementation: `src/transport.rs`.
+- **Automatic Let's Encrypt certificates** via `--acme-domain` (and optional
+  `--acme-email`, `--acme-cache`, `--acme-staging`). Uses ACME TLS-ALPN-01, so
+  validation and the relay share TCP 443 and no HTTP challenge server is needed.
+  Certificates are cached in `~/.reaven/acme` and renewed in the background.
+  Implementation: `src/tls.rs`.
+- **Existing PEM certificates** with `--tls-cert`/`--tls-key`.
+- **Self-signed local mode** with `--self-signed`, plus a global `--insecure` flag
+  and `REAVEN_INSECURE=true` for clients connecting to it.
+- Client `--server` accepts `host`, `host:port`, `https://host`, `wss://host/...`
+  and full `wss://host/path` URLs. Shorthand values are normalized to
+  `wss://host[:port]/ws`.
+- Android: OkHttp 4.12.0 WebSocket client over WSS, self-signed certificate
+  toggle on the Connect screen, default port 443, cleartext traffic disabled.
+
+### Changed
+- **Breaking:** the relay has no plaintext listener. `reaven server` now requires
+  one TLS mode (`--acme-domain`, `--tls-cert`/`--tls-key`, or `--self-signed`) and
+  defaults to `--listen 0.0.0.0:443`.
+- Protocol framing changed from newline-delimited JSON over raw TCP to one JSON
+  object per WebSocket message. v2 peers that predate this change cannot connect.
+- TLS uses `rustls` with the `ring` backend; no OpenSSL runtime dependency.
+- Android manifest no longer permits cleartext traffic.
+
+### Security
+- Passwords, shell traffic, screen frames and webcam frames are encrypted in
+  transit and protected against relay impersonation when certificate validation
+  is enabled. `--insecure` / **Allow self-signed certificate** turns that
+  authentication off and must be limited to local/self-signed relays.
+- TLS terminates at the relay, which remains a trusted component and can still
+  observe or alter routed frames. The shared-password model is unchanged.
+
+### Documented
+- Updated README, `docs/PROTOCOL.md`, `docs/RUNTIME.md` and `docs/ANDROID.md` for
+  WSS, TLS modes, ACME port-443 requirements, `--insecure`, and the rebuilt
+  Android client. Noted that the checked-in 0.2.0 binary and APK predate WSS and
+  must be rebuilt for the secure transport.
+
+### Testing
+- Unit tests cover URL normalization and frame formats.
+- `tests/e2e.sh` and `tests/android_client_sim.py` now run against a self-signed
+  WSS relay with `REAVEN_INSECURE=true`; the Python simulator performs its own TLS
+  and WebSocket handshake.
+
 ## 0.2.1 — no runtime dependencies
 
 ### Fixed

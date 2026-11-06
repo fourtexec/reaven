@@ -3,6 +3,7 @@ package dev.reaven.control.ui
 import android.content.Context
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
@@ -16,6 +17,7 @@ import androidx.compose.material3.Button
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
@@ -44,8 +46,9 @@ fun ConnectScreen(
     val scope = rememberCoroutineScope()
 
     var host by remember { mutableStateOf(prefs.getString("host", "") ?: "") }
-    var port by remember { mutableStateOf(prefs.getString("port", "7331") ?: "7331") }
+    var port by remember { mutableStateOf(prefs.getString("port", "443") ?: "443") }
     var password by remember { mutableStateOf(prefs.getString("password", "") ?: "") }
+    var insecure by remember { mutableStateOf(prefs.getBoolean("insecure", false)) }
     var deviceName by remember {
         mutableStateOf(prefs.getString("deviceName", "android") ?: "android")
     }
@@ -69,7 +72,8 @@ fun ConnectScreen(
                 host = host.trim(),
                 port = parsedPort,
                 password = password.ifBlank { null },
-                name = deviceName.ifBlank { "android" }
+                name = deviceName.ifBlank { "android" },
+                insecure = insecure
             )
             busy = false
             result.fold(
@@ -79,6 +83,7 @@ fun ConnectScreen(
                         .putString("port", parsedPort.toString())
                         .putString("password", password)
                         .putString("deviceName", deviceName)
+                        .putBoolean("insecure", insecure)
                         .apply()
                     onConnected()
                 },
@@ -156,7 +161,24 @@ fun ConnectScreen(
             modifier = Modifier.fillMaxWidth()
         )
 
-        Spacer(Modifier.height(20.dp))
+        Spacer(Modifier.height(8.dp))
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween
+        ) {
+            Text(
+                text = "Allow self-signed certificate",
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+            Switch(
+                checked = insecure,
+                onCheckedChange = { insecure = it },
+                enabled = !busy
+            )
+        }
+
+        Spacer(Modifier.height(12.dp))
         Button(
             onClick = ::submit,
             enabled = !busy,
@@ -186,8 +208,11 @@ fun ConnectScreen(
 
         Spacer(Modifier.height(28.dp))
         Text(
-            text = "Start the relay with:\n  reaven server --listen 0.0.0.0:7331 --password …\n" +
-                "and each machine with:\n  reaven connect --server <this-pc>:7331 --name desktop",
+            text = "Start the relay with:\n" +
+                "  reaven server --acme-domain relay.example.com \\\n" +
+                "    --acme-email you@example.com --password …\n" +
+                "and each machine with:\n" +
+                "  reaven connect --server relay.example.com --name desktop",
             style = MaterialTheme.typography.bodySmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
             fontFamily = FontFamily.Monospace

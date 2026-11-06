@@ -16,19 +16,17 @@ use std::sync::{mpsc as std_mpsc, Arc, Mutex as StdMutex};
 use std::thread;
 use std::time::Duration;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{bail, Result};
 use base64::{engine::general_purpose::STANDARD as B64, Engine};
 use portable_pty::{native_pty_system, CommandBuilder, PtySize};
-use tokio::io::BufReader;
-use tokio::net::TcpStream;
 use tokio::process::Command;
 use tokio::sync::mpsc;
 
 use crate::desktop::{self, Geometry};
 use crate::protocol::{
-    read_frame, write_frame, Frame, InputEvent, Operation, Payload, PeerInfo, PeerKind,
-    ResponseResult, VideoSource,
+    Frame, InputEvent, Operation, Payload, PeerInfo, PeerKind, ResponseResult, VideoSource,
 };
+use crate::transport;
 
 #[derive(Debug, Clone, Copy)]
 pub struct AgentOptions {
@@ -67,27 +65,23 @@ pub async fn run_peer(
     server: &str,
     name: &str,
     password: Option<String>,
+    insecure: bool,
     options: AgentOptions,
 ) -> Result<()> {
-    let stream = TcpStream::connect(server)
-        .await
-        .with_context(|| format!("connecting to {server}"))?;
-    let (read, mut write) = stream.into_split();
-    let mut reader = BufReader::new(read);
+    let ws = transport::connect(server, insecure).await?;
+    let (mut reader, mut write) = ws.split();
 
     let info = PeerInfo::local(name, PeerKind::Agent);
-    write_frame(
-        &mut write,
-        &Frame::Hello {
+    write
+        .send(&Frame::Hello {
             name: name.to_owned(),
             password,
             kind: PeerKind::Agent,
             info: Some(info),
-        },
-    )
-    .await?;
-    match read_frame(&mut reader).await? {
-        Frame::Welcome => println!("Reaven agent '{name}' online at {server}"),
+        })
+        .await?;
+    match reader.recv().await? {
+        Frame::Welcome => println!("Reaven agent '{name}' online at {server} (WSS)"),
         Frame::Error { message } => bail!("server rejected connection: {message}"),
         _ => bail!("unexpected server response"),
     }
@@ -104,7 +98,7 @@ pub async fn run_peer(
 
     let writer = tokio::spawn(async move {
         while let Some(frame) = rx.recv().await {
-            if write_frame(&mut write, &frame).await.is_err() {
+            if write.send(&frame).await.is_err() {
                 break;
             }
         }
@@ -112,7 +106,7 @@ pub async fn run_peer(
 
     let result: Result<()> = async {
         loop {
-            match read_frame(&mut reader).await? {
+            match reader.recv().await? {
                 Frame::Request { id, from, op, .. } => {
                     let tx = tx.clone();
                     tokio::spawn(async move {

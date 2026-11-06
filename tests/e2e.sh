@@ -45,6 +45,9 @@ if [ -z "${REAVEN_E2E_IN_XVFB:-}" ]; then
 fi
 
 export REAVEN_PASSWORD=$PASS
+# The e2e relay uses a throwaway self-signed certificate so the test needs no
+# public domain or Let's Encrypt account.
+export REAVEN_INSECURE=true
 
 # Xvfb only reflects pointer warps in XQueryPointer while some client has the
 # root pointer events selected, so start a listener before testing input. Without
@@ -56,8 +59,8 @@ if command -v xev >/dev/null; then
   sleep 0.5
 fi
 
-step "starting relay on $SERVER"
-"$BIN" server --listen "$SERVER" >"$OUT/relay.log" 2>&1 &
+step "starting WSS relay on $SERVER"
+"$BIN" server --listen "$SERVER" --self-signed >"$OUT/relay.log" 2>&1 &
 PIDS+=($!)
 wait_for 10 bash -c "</dev/tcp/127.0.0.1/$PORT" || { echo "relay did not start"; cat "$OUT/relay.log"; exit 1; }
 ok "relay listening"

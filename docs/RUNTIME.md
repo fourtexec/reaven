@@ -2,21 +2,70 @@
 
 ## TL;DR
 
-**Nothing to install.** The shipped binary is statically linked: it pulls in no
-shared libraries at all, so no `libxcb`, no `libX11`, no `libdbus`, no `libxdo`,
-no `libv4l`, and no glibc-version dependency.
+**Nothing to install.** A static source build pulls in no shared libraries at all,
+so no `libxcb`, no `libX11`, no `libdbus`, no `libxdo`, no `libv4l`, and no
+glibc-version dependency. TLS is provided by `rustls`/`ring`, not OpenSSL, so the
+secure transport also adds no shared-library requirement.
 
 ```bash
-chmod +x artifacts/reaven-0.2.0-linux-x86_64
-./artifacts/reaven-0.2.0-linux-x86_64 --version
+cargo build --release --target x86_64-unknown-linux-musl
+./target/x86_64-unknown-linux-musl/release/reaven --version
 ```
 
+The checked-in `artifacts/reaven-0.2.0-linux-x86_64` was built before the WSS
+change and still speaks plaintext TCP; build from source for a TLS-capable
+binary. The same binary cargo produces is statically linked when the musl target
+is used:
+
 ```
-$ ldd artifacts/reaven-0.2.0-linux-x86_64
-        statically linked
+$ file target/x86_64-unknown-linux-musl/release/reaven
+... statically linked ...
 ```
 
-For the Android app: **nothing.** Android 8.0+ and a network connection.
+For the Android app: an Android 8.0+ device and a network connection. A TLS relay
+needs no extra app install because the system CA store is used.
+
+## Network and TLS
+
+The relay **always** serves TLS and a WebSocket upgrade; there is no plaintext
+listener. Agents, CLI operators and the Android app all connect over WSS, normally
+to `wss://host:443/ws`.
+
+| Mode | Server flags | Requirements |
+|---|---|---|
+| **Automatic Let's Encrypt** | `--acme-domain relay.example.com [--acme-email you@example.com]` | public DNS name pointing at the relay; TCP **443** reachable from the internet; writable ACME cache |
+| **Existing certificate** | `--tls-cert fullchain.pem --tls-key privkey.pem` | PEM chain and matching unencrypted private key readable by the relay |
+| **Self-signed** | `--self-signed` | local testing; every client needs `--insecure` |
+
+ACME uses **TLS-ALPN-01**, so only TCP 443 is needed — there is no HTTP-01
+challenge and no port 80 listener. The certificate is obtained on first start and
+renewed in the background. Keep `~/.reaven/acme` (or `--acme-cache DIR`) on
+persistent storage and readable only by the relay user. `--acme-staging` issues
+certificates from the Let's Encrypt staging CA, which clients will not trust by
+default; use it to test the flow, not for production.
+
+Binding 443 normally needs root or `CAP_NET_BIND_SERVICE`. If another service
+owns 443, listen on a higher port and forward **external TCP 443** to it — for
+example `--listen 0.0.0.0:8443` plus a DNAT/load-balancer rule. The ACME
+validation still arrives on external 443. A reverse proxy must pass TLS through
+to the relay (TCP or TLS passthrough); terminating TLS at an HTTP proxy does not
+work, because the relay has no plaintext backend and runs its own WebSocket
+upgrade.
+
+Clients validate the certificate and hostname against the built-in WebPKI roots.
+Use `--insecure` (or `REAVEN_INSECURE=true`) only for a self-signed/local relay:
+it still encrypts the connection but disables authentication, so it does not
+protect against a man-in-the-middle.
+
+```bash
+# Public relay
+sudo reaven server --acme-domain relay.example.com \
+  --acme-email you@example.com --password 'long-random-secret'
+
+# Local self-signed relay + client
+reaven server --listen 127.0.0.1:17443 --self-signed --password 'test-secret'
+REAVEN_INSECURE=true reaven peers --server 127.0.0.1:17443
+```
 
 ## Why this matters
 
@@ -45,7 +94,9 @@ XWayland): $DISPLAY variable not set and no value was provided explicitly
 
 | Feature | Needs |
 |---|---|
-| relay, `exec`, `cl`, upload/download | nothing — works headless |
+| relay | TCP 443 (or a forwarded port), TLS certificate mode, root/`CAP_NET_BIND_SERVICE` for 443 |
+| agent / operator | outbound TCP 443, DNS, a trusted certificate (or `--insecure` for self-signed) |
+| relay, `exec`, `cl`, upload/download | nothing else — works headless |
 | screenshot / screen stream | an X11 display (`DISPLAY`), or XWayland on Wayland |
 | mouse + keyboard control | same as above |
 | webcam | a `/dev/video*` device + membership of the `video` group |
@@ -107,12 +158,22 @@ users, so the log is not something to remove.
 |---|---|
 | Android version | 8.0 (API 26) or newer |
 | Permissions | `INTERNET`, `ACCESS_NETWORK_STATE` only |
+| Network | WSS to the relay on port 443, with a certificate the system trusts |
 | Play Services / extra libs | none |
 | Storage permission | none (saves via MediaStore) |
 
+The checked-in `android/artifacts/reaven-control-0.2.0-debug.apk` predates the WSS
+client and still uses plaintext TCP. Rebuild from `android/` to get the secure
+client:
+
 ```bash
-adb install android/artifacts/reaven-control-0.2.0-debug.apk
+cd android && ./gradlew assembleDebug
+adb install app/build/outputs/apk/debug/app-debug.apk
 ```
+
+For a local self-signed relay, enable **Allow self-signed certificate** on the
+Connect screen. Leave it off for a Let's Encrypt relay: the app then validates
+the certificate against the Android system CA store.
 
 It is a **debug** build — fine to sideload, but not release-signed, so Play
 Protect will ask for confirmation.
@@ -122,10 +183,12 @@ Protect will ask for confirmation.
 If you would rather build (or need a different architecture):
 
 ```bash
-cargo build --release                                       # dynamic, ~5 MB
-cargo build --release --target x86_64-unknown-linux-musl    # static, ~3.9 MB
+cargo build --release                                       # dynamic
+cargo build --release --target x86_64-unknown-linux-musl    # static
 ```
 
-The only build-time packages that matter are `libclang-dev` (for the webcam
-v4l2 bindings) and `pkg-config`. Drop webcam support and you need neither:
+The only build-time packages that matter are a C toolchain for `ring`'s crypto
+assembly (and Perl on some platforms), `libclang-dev` (for the webcam v4l2
+bindings) and `pkg-config`. Drop webcam support and you need neither `libclang-dev`
+nor `pkg-config`; the C toolchain is still needed for TLS:
 `cargo build --release --no-default-features --features screen,input`.

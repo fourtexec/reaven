@@ -3,9 +3,8 @@
 //! Every frame is one JSON object followed by `\n`. The relay rewrites the
 //! `from` field so a peer cannot spoof another peer's identity.
 
-use anyhow::{bail, Context, Result};
+use anyhow::{bail, Result};
 use serde::{Deserialize, Serialize};
-use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt};
 
 /// Bumped when the frame set changes incompatibly.
 pub const PROTOCOL_VERSION: u32 = 2;
@@ -372,26 +371,6 @@ impl Payload {
             code: 0,
         }
     }
-}
-
-pub async fn write_frame<W: AsyncWrite + Unpin>(w: &mut W, frame: &Frame) -> Result<()> {
-    let mut line = serde_json::to_vec(frame)?;
-    line.push(b'\n');
-    w.write_all(&line).await?;
-    w.flush().await?;
-    Ok(())
-}
-
-pub async fn read_frame<R: AsyncBufRead + Unpin>(r: &mut R) -> Result<Frame> {
-    let mut buf = Vec::new();
-    let n = r.read_until(b'\n', &mut buf).await?;
-    if n == 0 {
-        bail!("connection closed");
-    }
-    if buf.len() > MAX_FRAME_BYTES {
-        bail!("protocol frame exceeded {MAX_FRAME_BYTES} bytes");
-    }
-    serde_json::from_slice(&buf).context("invalid protocol frame")
 }
 
 #[cfg(test)]

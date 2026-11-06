@@ -6,7 +6,9 @@ can do requires a running agent on the machine being controlled.
 
 ## Verified build
 
-This exact APK was built and inspected with:
+The checked-in APK was built with the toolchain below. The current source adds the
+WSS client described on this page (OkHttp 4.12.0); rebuild it to pick that up —
+the 0.2.0 APK in `artifacts/` still uses plaintext TCP.
 
 | Component | Version |
 |---|---|
@@ -15,15 +17,19 @@ This exact APK was built and inspected with:
 | Android Gradle Plugin | 8.5.2 |
 | Kotlin | 2.0.20 (Compose compiler plugin) |
 | Compose BOM | 2024.09.02 |
+| OkHttp (WSS client) | 4.12.0 |
 | compileSdk / targetSdk | 34 (Android 14) |
 | minSdk | 26 (Android 8.0) |
 | Build tools | 34.0.0 |
 
-Output: `android/artifacts/reaven-control-0.2.0-debug.apk`, 16 MB, package
-`dev.reaven.control`, permissions `INTERNET` and `ACCESS_NETWORK_STATE` only.
+Output for the 0.2.0 build: `android/artifacts/reaven-control-0.2.0-debug.apk`,
+16 MB, package `dev.reaven.control`, permissions `INTERNET` and
+`ACCESS_NETWORK_STATE` only. Rebuild from source for the WSS version:
 
 ```bash
-adb install android/artifacts/reaven-control-0.2.0-debug.apk
+cd android
+./gradlew assembleDebug
+adb install app/build/outputs/apk/debug/app-debug.apk
 ```
 
 ## Building from source
@@ -47,8 +53,8 @@ before shipping a release build.
 ```
 MainActivity.kt        app state machine: Connect → Machines → Device
 data/Protocol.kt       JSON builders + frame parser (mirrors src/protocol.rs)
-data/ReavenClient.kt   socket, frame dispatch, request/response futures, streams
-ui/ConnectScreen.kt    relay host/port/password, persisted in SharedPreferences
+data/ReavenClient.kt   OkHttp WebSocket over WSS, frame dispatch, request futures, streams
+ui/ConnectScreen.kt    relay host/port (default 443), password, self-signed switch
 ui/DevicesScreen.kt    machine list, refreshed every 3 s
 ui/DeviceScreen.kt     Scaffold + tabs
 ui/ScreenTab.kt        live stream + touch-to-mouse + keys + snapshot
@@ -57,11 +63,19 @@ ui/CameraTab.kt        remote webcam list, live view, single frame
 util/Gallery.kt        saves PNGs to MediaStore (no storage permission needed)
 ```
 
-`ReavenClient` keeps one socket per operator session. A single reader coroutine
-parses each line and routes it by `type`: responses resolve a
-`CompletableDeferred` keyed by request id, video frames go to a `SharedFlow`
-(dropping the oldest under backpressure rather than queueing), shell output and
-exits go to their own flows.
+`ReavenClient` keeps one **WSS WebSocket per operator session**, connecting to
+`wss://host:port/ws`. Each WebSocket text message is exactly one JSON frame; the
+`WebSocketListener.onMessage` callback parses it and routes by `type`: responses
+resolve a `CompletableDeferred` keyed by request id, video frames go to a
+`SharedFlow` (dropping the oldest under backpressure rather than queueing), shell
+output and exits go to their own flows. OkHttp handles ping/pong and the TLS
+handshake.
+
+The default client trusts the Android system CA store, so a Let's Encrypt relay
+works normally. **Allow self-signed certificate** installs a permissive
+`X509TrustManager` and hostname verifier for that connection only; it is intended
+for a local relay and disables MITM protection. Cleartext HTTP/WS is disabled in
+`AndroidManifest.xml` (`usesCleartextTraffic="false"`).
 
 ### Touch mapping
 
@@ -99,8 +113,11 @@ Drag is detected after a 14 px slop so a slightly wobbly tap is still a click.
   protocol already supports it.
 - **Portrait/landscape**: the stream re-fits automatically, but the control bar
   is optimised for portrait.
-- **Password stored in plain SharedPreferences**, and cleartext TCP is allowed.
-  Fine on a trusted LAN, not fine on a shared phone or public network.
+- **Password stored in plain SharedPreferences.** Fine for a phone you control,
+  not for a shared device. Use a dedicated relay password.
+- **No certificate pinning.** The app trusts any certificate the system store
+  accepts for the relay hostname. Leave **Allow self-signed certificate** off
+  except for a local/self-signed relay; with it on, any certificate is accepted.
 - Frames are decoded on `Dispatchers.Default`; on very old devices a 1600 px
   stream at 15 fps will drop frames (backpressure drops the oldest, so the app
   stays responsive).

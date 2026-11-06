@@ -111,7 +111,7 @@ fun DevicesScreen(
                         Spacer(Modifier.height(8.dp))
                         Text(
                             text = "On the computer you want to reach, run:\n" +
-                                "reaven connect --server <relay>:7331 --name desktop",
+                                "reaven connect --server <relay-domain> --name desktop",
                             style = MaterialTheme.typography.bodySmall,
                             fontFamily = FontFamily.Monospace,
                             color = MaterialTheme.colorScheme.onSurfaceVariant

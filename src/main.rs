@@ -12,6 +12,8 @@ mod httpd;
 mod operator;
 mod protocol;
 mod relay;
+mod tls;
+mod transport;
 
 use std::path::PathBuf;
 
@@ -19,27 +21,53 @@ use anyhow::{anyhow, bail, Context, Result};
 use clap::{Parser, Subcommand};
 
 use protocol::{MouseButton, Operation, VideoSource};
+use tls::TlsOptions;
 
 #[derive(Parser)]
 #[command(
     name = "reaven",
     version,
-    about = "Server-relayed remote administration: shell, files, screen, webcam, input",
+    about = "Server-relayed remote administration over WSS: shell, files, screen, webcam, input",
     long_about = None
 )]
 struct Cli {
+    /// Skip TLS certificate verification (self-signed/local relays only).
+    #[arg(long, global = true, env = "REAVEN_INSECURE")]
+    insecure: bool,
+
     #[command(subcommand)]
     command: Commands,
 }
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Run the relay server. Keep this port private or protect it with a firewall/VPN.
+    /// Run the WSS relay. Use --acme-domain for an automatic Let's Encrypt certificate.
     Server {
-        #[arg(long, default_value = "0.0.0.0:7331")]
+        #[arg(long, default_value = "0.0.0.0:443")]
         listen: String,
         #[arg(long, env = "REAVEN_PASSWORD")]
         password: Option<String>,
+        /// Domain(s) to obtain a certificate for automatically (comma-separated).
+        #[arg(long = "acme-domain", value_delimiter = ',')]
+        acme_domains: Vec<String>,
+        /// Contact email for the ACME account.
+        #[arg(long = "acme-email")]
+        acme_email: Option<String>,
+        /// Directory for cached ACME account and certificate data.
+        #[arg(long = "acme-cache", default_value_os_t = tls::default_acme_cache())]
+        acme_cache: PathBuf,
+        /// Use Let's Encrypt staging (for testing; issues untrusted certificates).
+        #[arg(long = "acme-staging")]
+        acme_staging: bool,
+        /// Existing PEM certificate chain (use with --tls-key).
+        #[arg(long = "tls-cert")]
+        tls_cert: Option<PathBuf>,
+        /// Existing PEM private key (use with --tls-cert).
+        #[arg(long = "tls-key")]
+        tls_key: Option<PathBuf>,
+        /// Generate a throwaway self-signed certificate for local testing.
+        #[arg(long = "self-signed")]
+        self_signed: bool,
     },
     /// Register this computer as an online peer (run in the background for availability).
     Connect {
@@ -260,9 +288,42 @@ fn parse_point(raw: &str) -> Result<(f32, f32)> {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // ACME/certificate lifecycle is logged through `log`; keep the default
+    // quiet except for certificate events.
+    let _ = env_logger::Builder::from_env(
+        env_logger::Env::default().default_filter_or("rustls_acme=info"),
+    )
+    .try_init();
+
     let cli = Cli::parse();
+    let insecure = cli.insecure;
     match cli.command {
-        Commands::Server { listen, password } => relay::run_server(&listen, password).await,
+        Commands::Server {
+            listen,
+            password,
+            acme_domains,
+            acme_email,
+            acme_cache,
+            acme_staging,
+            tls_cert,
+            tls_key,
+            self_signed,
+        } => {
+            relay::run_server(
+                &listen,
+                password,
+                TlsOptions {
+                    acme_domains,
+                    acme_email,
+                    acme_cache,
+                    acme_staging,
+                    cert: tls_cert,
+                    key: tls_key,
+                    self_signed,
+                },
+            )
+            .await
+        }
         Commands::Connect {
             server,
             name,
@@ -273,54 +334,57 @@ async fn main() -> Result<()> {
                 &server,
                 &name,
                 password,
+                insecure,
                 agent::AgentOptions {
                     allow_input: !no_input,
                 },
             )
             .await
         }
-        Commands::Peers { server, password } => operator::run_peers(&server, password).await,
+        Commands::Peers { server, password } => {
+            operator::run_peers(&server, password, insecure).await
+        }
         Commands::Cl {
             server,
             target,
             password,
-        } => operator::run_cl(&server, password, &target).await,
+        } => operator::run_cl(&server, password, insecure, &target).await,
         Commands::Exec {
             server,
             target,
             command,
             password,
-        } => operator::run_exec(&server, password, &target, command).await,
+        } => operator::run_exec(&server, password, insecure, &target, command).await,
         Commands::Upload {
             server,
             target,
             local,
             remote,
             password,
-        } => operator::run_upload(&server, password, &target, local, remote).await,
+        } => operator::run_upload(&server, password, insecure, &target, local, remote).await,
         Commands::Download {
             server,
             target,
             remote,
             local,
             password,
-        } => operator::run_download(&server, password, &target, remote, local).await,
+        } => operator::run_download(&server, password, insecure, &target, remote, local).await,
         Commands::InstallAutostart {
             server,
             name,
             password,
             no_input,
-        } => install_autostart(&server, &name, password.as_deref(), no_input),
+        } => install_autostart(&server, &name, password.as_deref(), no_input, insecure),
         Commands::Screens {
             server,
             target,
             password,
-        } => operator::run_screens(&server, password, &target).await,
+        } => operator::run_screens(&server, password, insecure, &target).await,
         Commands::Cameras {
             server,
             target,
             password,
-        } => operator::run_cameras(&server, password, &target).await,
+        } => operator::run_cameras(&server, password, insecure, &target).await,
         Commands::Screenshot {
             server,
             target,
@@ -331,7 +395,7 @@ async fn main() -> Result<()> {
             password,
         } => {
             operator::run_screenshot(
-                &server, password, &target, monitor, quality, max_width, &output,
+                &server, password, insecure, &target, monitor, quality, max_width, &output,
             )
             .await
         }
@@ -352,6 +416,7 @@ async fn main() -> Result<()> {
             operator::run_stream(operator::StreamOptions {
                 server,
                 password,
+                insecure,
                 target,
                 source: VideoSource::Screen { monitor },
                 fps,
@@ -380,7 +445,7 @@ async fn main() -> Result<()> {
         } => match snapshot {
             Some(output) => {
                 operator::run_camera_snapshot(
-                    &server, password, &target, index, max_width, quality, &output,
+                    &server, password, insecure, &target, index, max_width, quality, &output,
                 )
                 .await
             }
@@ -388,6 +453,7 @@ async fn main() -> Result<()> {
                 operator::run_stream(operator::StreamOptions {
                     server,
                     password,
+                    insecure,
                     target,
                     source: VideoSource::Camera { index },
                     fps,
@@ -423,7 +489,7 @@ async fn main() -> Result<()> {
             let events = operator::build_input_events(
                 at, button, double, scroll, scroll_x, key, text, combo,
             );
-            operator::run_input(&server, password, &target, events).await
+            operator::run_input(&server, password, insecure, &target, events).await
         }
     }
 }
@@ -433,6 +499,7 @@ fn install_autostart(
     name: &str,
     password: Option<&str>,
     no_input: bool,
+    insecure: bool,
 ) -> Result<()> {
     let home = std::env::var_os("HOME").ok_or_else(|| anyhow!("HOME is not set"))?;
     let path = PathBuf::from(home).join(".bashrc");
@@ -449,11 +516,12 @@ fn install_autostart(
     let exe = std::env::current_exe().context("locating reaven executable")?;
     let quote = |s: &str| format!("'{}'", s.replace('\'', "'\\''"));
     let args = format!(
-        "{} connect --server {} --name {}{}",
+        "{} connect --server {} --name {}{}{}",
         quote(&exe.to_string_lossy()),
         quote(server),
         quote(name),
-        if no_input { " --no-input" } else { "" }
+        if no_input { " --no-input" } else { "" },
+        if insecure { " --insecure" } else { "" }
     );
     let env_prefix = password
         .map(|p| format!("REAVEN_PASSWORD={} ", quote(p)))

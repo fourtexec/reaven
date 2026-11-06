@@ -14,46 +14,39 @@ use crossterm::{
     event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
     terminal,
 };
-use tokio::io::BufReader;
-use tokio::net::tcp::OwnedReadHalf;
-use tokio::net::TcpStream;
 use tokio::sync::{broadcast, mpsc};
 use uuid::Uuid;
 
 use crate::desktop::{CameraInfo, MonitorInfo};
 use crate::httpd::{self, ViewerConfig};
 use crate::protocol::{
-    read_frame, write_frame, Frame, InputEvent, MouseButton, Operation, Payload, PeerInfo,
-    PeerKind, ResponseResult, VideoSource,
+    Frame, InputEvent, MouseButton, Operation, Payload, PeerInfo, PeerKind, ResponseResult,
+    VideoSource,
 };
 use crate::relay;
+use crate::transport::{self, ClientIo, FrameReader};
 
 /// A live connection to the relay, acting as an operator.
 pub struct OperatorLink {
     pub name: String,
     tx: mpsc::UnboundedSender<Frame>,
-    reader: BufReader<OwnedReadHalf>,
+    reader: FrameReader<ClientIo>,
 }
 
 impl OperatorLink {
-    pub async fn connect(server: &str, password: Option<String>) -> Result<Self> {
-        let stream = TcpStream::connect(server)
-            .await
-            .with_context(|| format!("connecting to {server}"))?;
-        let (read, mut write) = stream.into_split();
-        let mut reader = BufReader::new(read);
+    pub async fn connect(server: &str, password: Option<String>, insecure: bool) -> Result<Self> {
+        let ws = transport::connect(server, insecure).await?;
+        let (mut reader, mut write) = ws.split();
         let name = format!("operator-{}", Uuid::new_v4());
-        write_frame(
-            &mut write,
-            &Frame::Hello {
+        write
+            .send(&Frame::Hello {
                 name: name.clone(),
                 password,
                 kind: PeerKind::Operator,
                 info: None,
-            },
-        )
-        .await?;
-        match read_frame(&mut reader).await? {
+            })
+            .await?;
+        match reader.recv().await? {
             Frame::Welcome => {}
             Frame::Error { message } => bail!("server rejected connection: {message}"),
             _ => bail!("unexpected server response"),
@@ -61,7 +54,7 @@ impl OperatorLink {
         let (tx, mut rx) = mpsc::unbounded_channel::<Frame>();
         tokio::spawn(async move {
             while let Some(frame) = rx.recv().await {
-                if write_frame(&mut write, &frame).await.is_err() {
+                if write.send(&frame).await.is_err() {
                     break;
                 }
             }
@@ -78,7 +71,7 @@ impl OperatorLink {
     }
 
     pub async fn recv(&mut self) -> Result<Frame> {
-        read_frame(&mut self.reader).await
+        self.reader.recv().await
     }
 
     /// Send a request and wait for the matching response, ignoring unrelated
@@ -127,8 +120,8 @@ impl OperatorLink {
 
 // ------------------------------------------------------------------- peers ---
 
-pub async fn run_peers(server: &str, password: Option<String>) -> Result<()> {
-    let mut link = OperatorLink::connect(server, password).await?;
+pub async fn run_peers(server: &str, password: Option<String>, insecure: bool) -> Result<()> {
+    let mut link = OperatorLink::connect(server, password, insecure).await?;
     let peers = link.list_peers().await?;
     print!("{}", relay::describe_peers(&peers));
     Ok(())
@@ -139,10 +132,11 @@ pub async fn run_peers(server: &str, password: Option<String>) -> Result<()> {
 pub async fn run_exec(
     server: &str,
     password: Option<String>,
+    insecure: bool,
     target: &str,
     command: String,
 ) -> Result<()> {
-    let mut link = OperatorLink::connect(server, password).await?;
+    let mut link = OperatorLink::connect(server, password, insecure).await?;
     match link.request(target, Operation::Exec { command }).await? {
         Payload::Text {
             stdout,
@@ -163,6 +157,7 @@ pub async fn run_exec(
 pub async fn run_upload(
     server: &str,
     password: Option<String>,
+    insecure: bool,
     target: &str,
     local: PathBuf,
     remote: PathBuf,
@@ -170,7 +165,7 @@ pub async fn run_upload(
     let bytes = tokio::fs::read(&local)
         .await
         .with_context(|| format!("reading {}", local.display()))?;
-    let mut link = OperatorLink::connect(server, password).await?;
+    let mut link = OperatorLink::connect(server, password, insecure).await?;
     let payload = link
         .request(
             target,
@@ -186,11 +181,12 @@ pub async fn run_upload(
 pub async fn run_download(
     server: &str,
     password: Option<String>,
+    insecure: bool,
     target: &str,
     remote: PathBuf,
     local: PathBuf,
 ) -> Result<()> {
-    let mut link = OperatorLink::connect(server, password).await?;
+    let mut link = OperatorLink::connect(server, password, insecure).await?;
     let payload = link
         .request(
             target,
@@ -233,13 +229,14 @@ fn expect_text(payload: Payload) -> Result<()> {
 pub async fn run_screenshot(
     server: &str,
     password: Option<String>,
+    insecure: bool,
     target: &str,
     monitor: u32,
     quality: u8,
     max_width: u32,
     output: &Path,
 ) -> Result<()> {
-    let mut link = OperatorLink::connect(server, password).await?;
+    let mut link = OperatorLink::connect(server, password, insecure).await?;
     let payload = link
         .request(
             target,
@@ -256,13 +253,14 @@ pub async fn run_screenshot(
 pub async fn run_camera_snapshot(
     server: &str,
     password: Option<String>,
+    insecure: bool,
     target: &str,
     index: u32,
     width: u32,
     quality: u8,
     output: &Path,
 ) -> Result<()> {
-    let mut link = OperatorLink::connect(server, password).await?;
+    let mut link = OperatorLink::connect(server, password, insecure).await?;
     let payload = link
         .request(
             target,
@@ -306,8 +304,13 @@ fn save_image(payload: Payload, output: &Path) -> Result<()> {
     }
 }
 
-pub async fn run_screens(server: &str, password: Option<String>, target: &str) -> Result<()> {
-    let mut link = OperatorLink::connect(server, password).await?;
+pub async fn run_screens(
+    server: &str,
+    password: Option<String>,
+    insecure: bool,
+    target: &str,
+) -> Result<()> {
+    let mut link = OperatorLink::connect(server, password, insecure).await?;
     let payload = link.request(target, Operation::ListScreens).await?;
     match payload {
         Payload::Json { data } => {
@@ -335,8 +338,13 @@ pub async fn run_screens(server: &str, password: Option<String>, target: &str) -
     }
 }
 
-pub async fn run_cameras(server: &str, password: Option<String>, target: &str) -> Result<()> {
-    let mut link = OperatorLink::connect(server, password).await?;
+pub async fn run_cameras(
+    server: &str,
+    password: Option<String>,
+    insecure: bool,
+    target: &str,
+) -> Result<()> {
+    let mut link = OperatorLink::connect(server, password, insecure).await?;
     let payload = link.request(target, Operation::ListCameras).await?;
     match payload {
         Payload::Json { data } => {
@@ -359,6 +367,7 @@ pub async fn run_cameras(server: &str, password: Option<String>, target: &str) -
 pub struct StreamOptions {
     pub server: String,
     pub password: Option<String>,
+    pub insecure: bool,
     pub target: String,
     pub source: VideoSource,
     pub fps: u8,
@@ -374,6 +383,7 @@ pub async fn run_stream(options: StreamOptions) -> Result<()> {
     let StreamOptions {
         server,
         password,
+        insecure,
         target,
         source,
         fps,
@@ -385,7 +395,7 @@ pub async fn run_stream(options: StreamOptions) -> Result<()> {
         allow_input,
     } = options;
 
-    let link = OperatorLink::connect(&server, password).await?;
+    let link = OperatorLink::connect(&server, password, insecure).await?;
     let stream_id = Uuid::new_v4().to_string();
     let (frames_tx, _) = broadcast::channel::<Arc<Vec<u8>>>(32);
     let latest: Arc<Mutex<Option<Arc<Vec<u8>>>>> = Arc::new(Mutex::new(None));
@@ -530,13 +540,14 @@ fn describe_source(source: VideoSource) -> String {
 pub async fn run_input(
     server: &str,
     password: Option<String>,
+    insecure: bool,
     target: &str,
     events: Vec<InputEvent>,
 ) -> Result<()> {
     if events.is_empty() {
         bail!("no input events given (see --help)");
     }
-    let mut link = OperatorLink::connect(server, password).await?;
+    let mut link = OperatorLink::connect(server, password, insecure).await?;
     let id = Uuid::new_v4().to_string();
     link.send(Frame::Control {
         id: id.clone(),
@@ -641,48 +652,46 @@ impl Drop for RawModeGuard {
     }
 }
 
-pub async fn run_cl(server: &str, password: Option<String>, target: &str) -> Result<()> {
+pub async fn run_cl(
+    server: &str,
+    password: Option<String>,
+    insecure: bool,
+    target: &str,
+) -> Result<()> {
     let (cols, rows) = terminal::size().context("reading local terminal size")?;
     let _raw_mode = RawModeGuard::enable()?;
     let term = std::env::var("TERM").unwrap_or_else(|_| "xterm-256color".to_string());
-    let stream = TcpStream::connect(server)
-        .await
-        .with_context(|| format!("connecting to {server}"))?;
-    let (read, mut write) = stream.into_split();
-    let mut reader = BufReader::new(read);
+    let ws = transport::connect(server, insecure).await?;
+    let (mut reader, mut write) = ws.split();
     let peer_name = format!("operator-shell-{}", Uuid::new_v4());
-    write_frame(
-        &mut write,
-        &Frame::Hello {
+    write
+        .send(&Frame::Hello {
             name: peer_name,
             password,
             kind: PeerKind::Operator,
             info: None,
-        },
-    )
-    .await?;
-    match read_frame(&mut reader).await? {
+        })
+        .await?;
+    match reader.recv().await? {
         Frame::Welcome => {}
         Frame::Error { message } => bail!("server rejected connection: {message}"),
         _ => bail!("unexpected server response"),
     }
     let id = Uuid::new_v4().to_string();
-    write_frame(
-        &mut write,
-        &Frame::ShellStart {
+    write
+        .send(&Frame::ShellStart {
             id: id.clone(),
             from: String::new(),
             target: target.to_string(),
             rows,
             cols,
             term,
-        },
-    )
-    .await?;
+        })
+        .await?;
     let (out_tx, mut out_rx) = mpsc::unbounded_channel::<Frame>();
     let writer = tokio::spawn(async move {
         while let Some(frame) = out_rx.recv().await {
-            if write_frame(&mut write, &frame).await.is_err() {
+            if write.send(&frame).await.is_err() {
                 break;
             }
         }
@@ -727,7 +736,7 @@ pub async fn run_cl(server: &str, password: Option<String>, target: &str) -> Res
     let result: Result<()> = async {
         loop {
             tokio::select! {
-                frame = read_frame(&mut reader) => {
+                frame = reader.recv() => {
                     match frame? {
                         Frame::ShellOutput { id: frame_id, data, .. } if frame_id == id => {
                             let bytes = B64.decode(data).context("invalid shell output frame")?;

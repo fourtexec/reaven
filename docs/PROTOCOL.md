@@ -1,10 +1,45 @@
-# Reaven protocol (v2)
+# Reaven protocol (v2 over WSS)
 
-Newline-delimited JSON over one TCP connection per peer. Every frame is a single
-JSON object followed by `\n`. The relay rewrites `from` on every frame it
-forwards, so a peer cannot impersonate another.
+Each peer opens **one TLS-protected WebSocket** to the relay, conventionally
+`wss://relay.example/ws`. Every protocol frame is exactly one JSON object carried
+in one WebSocket **text message**. There is no newline framing: the old
+newline-delimited TCP protocol is gone, and a v2 peer that does not perform the
+WebSocket upgrade cannot connect. Incoming binary messages are also accepted and
+parsed as UTF-8 JSON (the Rust and Android clients send text).
 
-Implementation: `src/protocol.rs`. Android port: `android/app/src/main/java/dev/reaven/control/data/Protocol.kt`.
+The WebSocket layer handles ping/pong and close frames; `FrameReader` silently
+skips ping/pong and treats close as end of session. A single message is limited
+to `MAX_FRAME_BYTES` (32 MB); larger messages are rejected and the connection is
+dropped.
+
+The relay rewrites `from` on every frame it forwards, so a peer cannot impersonate
+another.
+
+Implementation: `src/protocol.rs` (frame types) and `src/transport.rs` (WSS
+handshake and message framing). Android port:
+`android/app/src/main/java/dev/reaven/control/data/Protocol.kt`.
+
+## Transport and addresses
+
+The relay always terminates TLS; there is no plaintext listener. Certificates can
+come from ACME/Let's Encrypt (`--acme-domain`), an existing PEM pair
+(`--tls-cert`/`--tls-key`), or `--self-signed` for local testing. The Rust clients
+verify the relay certificate and hostname against the built-in WebPKI roots (the
+Android app uses the system CA store) unless `--insecure` / **Allow self-signed
+certificate** is used.
+
+`--server` accepts either a full URL or the shorthand form:
+
+| Input | Connects to |
+|---|---|
+| `relay.example.com` | `wss://relay.example.com/ws` |
+| `relay.example.com:443` | `wss://relay.example.com:443/ws` |
+| `https://relay.example.com` | `wss://relay.example.com/ws` |
+| `wss://relay.example.com/custom` | `wss://relay.example.com/custom` |
+
+The relay does not route on the HTTP path, so `/ws` is a convention rather than a
+requirement. WebSocket authentication is in-band: the first frame must be
+`hello`; HTTP Basic auth is not used.
 
 ## Envelope
 
@@ -158,8 +193,14 @@ An agent started with `--no-input` refuses every `control` frame with
 
 ## Throughput notes
 
-- Frames are base64 inside JSON lines, so a frame costs ~4/3 its JPEG size plus
-  JSON overhead. A 1600px-wide screen at quality 70 lands around 60–200 KB per frame.
+- Frames are base64 inside JSON text messages, so a frame costs ~4/3 its JPEG
+  size plus JSON and WebSocket/TLS overhead. A 1600px-wide screen at quality 70
+  lands around 60–200 KB per frame.
+- TLS adds a small per-message overhead but no extra round trip after the
+  handshake. WebSocket permessage-deflate is not enabled.
 - The agent caps `fps`; a slow consumer does not slow capture but does grow the
   relay's per-peer queue. Prefer 8–15 fps over WAN links.
-- `MAX_FRAME_BYTES` is 32 MB; anything larger is refused and the connection dropped.
+- `MAX_FRAME_BYTES` is 32 MB at both the protocol and WebSocket layers; anything
+  larger is refused and the connection dropped.
+- Error strings are sent as `error` frames before the socket closes where
+  possible (authentication failure, duplicate peer name).
