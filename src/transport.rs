@@ -3,7 +3,8 @@
 //! Reaven deliberately looks like ordinary HTTPS traffic: clients connect to
 //! `wss://relay.example/ws` on 443 with a normal browser-style WebSocket
 //! upgrade. The relay, agents and operator CLI all speak this transport. There
-//! is no plaintext listener.
+//! is no public plaintext listener; the relay can opt into a loopback-only
+//! plaintext listener for a local TLS-terminating reverse proxy.
 //!
 //! Frame framing is unchanged from protocol v2: each WebSocket text message is
 //! one JSON object. Splitting the socket into independent read/write halves lets

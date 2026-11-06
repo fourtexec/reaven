@@ -21,23 +21,25 @@ that and adds the remote-desktop half, an operator app for phones, and a secure
                               └────────────┘        └────────────────┘
 ```
 
-Every peer connects with a standard TLS-protected WebSocket
+Every public peer connects with a standard TLS-protected WebSocket
 (`wss://relay.example/ws`). The relay routes frames by peer name; pixels and
-input never terminate there. There is **no plaintext listener**: the relay always
-serves TLS, and agents/operators always verify the certificate unless explicitly
-told not to.
+input never terminate there. There is **no public plaintext listener**:
+agents/operators always verify the certificate unless explicitly told not to.
+The only exception is the loopback-only `--plaintext` mode for a local
+TLS-terminating reverse proxy, documented below.
 
 ---
 
 ## Secure transport
 
-The relay speaks **WSS** on port 443. Pick one TLS mode, in this priority order:
+The relay speaks **WSS** on port 443 by default. Pick one transport mode:
 
 | Mode | Server flags | Use it for |
 |---|---|---|
 | **ACME / Let's Encrypt** | `--acme-domain relay.example.com [--acme-email you@example.com]` | a public relay with a real domain |
 | **Existing certificate** | `--tls-cert fullchain.pem --tls-key privkey.pem` | a certificate you already manage |
 | **Self-signed** | `--self-signed` | local testing only |
+| **Local reverse proxy** | `--plaintext --listen 127.0.0.1:8443` | nginx/Caddy terminates TLS; loopback only |
 
 Automatic certificates use **TLS-ALPN-01**, so no separate HTTP challenge server
 is needed: validation and the relay both use TCP 443. Requirements:
@@ -71,6 +73,50 @@ REAVEN_INSECURE=true reaven peers --server 127.0.0.1:17443
 
 Without `--insecure`, the client uses the built-in WebPKI roots and rejects
 self-signed, expired, mismatched or otherwise untrusted certificates.
+
+### Behind nginx or another TLS-terminating proxy
+
+If nginx already owns 443 and manages the certificate (for example with
+certbot), run the relay without TLS on **loopback only** and proxy WebSocket
+traffic to it:
+
+```bash
+reaven server --listen 127.0.0.1:8443 --plaintext --password 'use-a-long-random-secret'
+```
+
+```nginx
+server {
+    listen 443 ssl;
+    server_name relay.example.com;
+
+    ssl_certificate     /etc/letsencrypt/live/relay.example.com/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/relay.example.com/privkey.pem;
+
+    location /ws {
+        proxy_pass http://127.0.0.1:8443;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_set_header Host $host;
+        proxy_read_timeout 3600s;
+        proxy_send_timeout 3600s;
+        proxy_buffering off;
+    }
+}
+```
+
+Agents and operators still connect to the public **WSS** address
+(`wss://relay.example.com/ws`); only the loopback hop is plaintext.
+`--plaintext` refuses to bind to a non-loopback address, so it cannot
+accidentally expose an unencrypted relay. It is separate from the client
+`--insecure` flag: `--plaintext` controls the server listener, `--insecure`
+disables certificate verification on a client.
+
+For a direct local test without nginx, use a `ws://` URL:
+
+```bash
+reaven peers --server ws://127.0.0.1:8443/ws
+```
 
 ---
 
@@ -341,7 +387,9 @@ the new features make them matter more.
   webcam frames from passive interception and from a MITM impersonating the
   relay. It depends on a correct domain and certificate: `--insecure` /
   **Allow self-signed certificate** disables validation and therefore MITM
-  protection. Use it only on loopback or a trusted LAN.
+  protection. Use it only on loopback or a trusted LAN. The loopback
+  `--plaintext` server mode is likewise only safe behind a local TLS-terminating
+  proxy; never expose that port.
 - **The relay sees traffic after TLS termination.** It is a trusted component:
   it routes frames, so it could observe or alter them. TLS protects the hops to
   the relay, not the relay itself. Do not use a relay you do not trust.
@@ -404,7 +452,7 @@ of pixels. This is the check that caught two real viewer bugs (per-part `load`
 events not firing for MJPEG, and a byte-comparison error in the multipart parser).
 
 ```
-cargo test: 15 passed
+cargo test: 18 passed
 ```
 
 The Xvfb-based checks need `xvfb-run`, `Xvfb`, `xdotool` and (for the viewer

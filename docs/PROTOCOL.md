@@ -21,12 +21,18 @@ handshake and message framing). Android port:
 
 ## Transport and addresses
 
-The relay always terminates TLS; there is no plaintext listener. Certificates can
-come from ACME/Let's Encrypt (`--acme-domain`), an existing PEM pair
-(`--tls-cert`/`--tls-key`), or `--self-signed` for local testing. The Rust clients
-verify the relay certificate and hostname against the built-in WebPKI roots (the
-Android app uses the system CA store) unless `--insecure` / **Allow self-signed
-certificate** is used.
+The relay terminates TLS by default; there is no public plaintext listener.
+Certificates can come from ACME/Let's Encrypt (`--acme-domain`), an existing PEM
+pair (`--tls-cert`/`--tls-key`), or `--self-signed` for local testing. The Rust
+clients verify the relay certificate and hostname against the built-in WebPKI
+roots (the Android app uses the system CA store) unless `--insecure` / **Allow
+self-signed certificate** is used.
+
+For a deployment where nginx or another local proxy terminates TLS, the relay may
+run with `--plaintext` on a **loopback address only**. External peers still use
+WSS to the proxy; only the proxy-to-relay hop is plaintext. A direct local test
+can connect with `ws://127.0.0.1:<port>/ws`. `--plaintext` is a server flag and is
+unrelated to the client `--insecure` flag.
 
 `--server` accepts either a full URL or the shorthand form:
 

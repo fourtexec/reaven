@@ -30,9 +30,10 @@ pub async fn run_server(
     password: Option<String>,
     tls_options: TlsOptions,
 ) -> Result<()> {
+    let scheme = if tls_options.plaintext { "ws" } else { "wss" };
     let mut incoming = tls::bind(addr, tls_options).await?;
     println!(
-        "Reaven relay v{} (protocol v{}) listening on wss://{addr}/ws{}",
+        "Reaven relay v{} (protocol v{}) listening on {scheme}://{addr}/ws{}",
         env!("CARGO_PKG_VERSION"),
         PROTOCOL_VERSION,
         if password.is_some() {

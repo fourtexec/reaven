@@ -14,6 +14,9 @@
   Certificates are cached in `~/.reaven/acme` and renewed in the background.
   Implementation: `src/tls.rs`.
 - **Existing PEM certificates** with `--tls-cert`/`--tls-key`.
+- **Loopback-only plaintext mode** with `--plaintext` (alias `--no-tls`) for a
+  local reverse proxy that terminates TLS, such as nginx. The relay refuses to
+  bind a non-loopback address in this mode; external clients still use WSS.
 - **Self-signed local mode** with `--self-signed`, plus a global `--insecure` flag
   and `REAVEN_INSECURE=true` for clients connecting to it.
 - Client `--server` accepts `host`, `host:port`, `https://host`, `wss://host/...`
@@ -23,9 +26,9 @@
   toggle on the Connect screen, default port 443, cleartext traffic disabled.
 
 ### Changed
-- **Breaking:** the relay has no plaintext listener. `reaven server` now requires
-  one TLS mode (`--acme-domain`, `--tls-cert`/`--tls-key`, or `--self-signed`) and
-  defaults to `--listen 0.0.0.0:443`.
+- **Breaking:** the relay no longer has a public plaintext listener. `reaven
+  server` requires `--acme-domain`, `--tls-cert`/`--tls-key`, `--self-signed`, or
+  the loopback-only `--plaintext` mode, and defaults to `--listen 0.0.0.0:443`.
 - Protocol framing changed from newline-delimited JSON over raw TCP to one JSON
   object per WebSocket message. v2 peers that predate this change cannot connect.
 - TLS uses `rustls` with the `ring` backend; no OpenSSL runtime dependency.
@@ -38,12 +41,15 @@
   authentication off and must be limited to local/self-signed relays.
 - TLS terminates at the relay, which remains a trusted component and can still
   observe or alter routed frames. The shared-password model is unchanged.
+- `--plaintext` is loopback-only and intended for a local TLS-terminating proxy.
+  It disables encryption on that local hop; never expose the relay port directly.
 
 ### Documented
 - Updated README, `docs/PROTOCOL.md`, `docs/RUNTIME.md` and `docs/ANDROID.md` for
-  WSS, TLS modes, ACME port-443 requirements, `--insecure`, and the rebuilt
-  Android client. Noted that the checked-in 0.2.0 binary and APK predate WSS and
-  must be rebuilt for the secure transport.
+  WSS, TLS modes, ACME port-443 requirements, the loopback-only `--plaintext`
+  mode with an nginx example, `--insecure`, and the rebuilt Android client. Noted
+  that the checked-in 0.2.0 binary and APK predate WSS and must be rebuilt for the
+  secure transport.
 
 ### Testing
 - Unit tests cover URL normalization and frame formats.

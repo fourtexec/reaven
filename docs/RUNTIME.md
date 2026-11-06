@@ -27,15 +27,16 @@ needs no extra app install because the system CA store is used.
 
 ## Network and TLS
 
-The relay **always** serves TLS and a WebSocket upgrade; there is no plaintext
-listener. Agents, CLI operators and the Android app all connect over WSS, normally
-to `wss://host:443/ws`.
+The relay normally serves TLS and a WebSocket upgrade; there is no public
+plaintext listener. Agents, CLI operators and the Android app all connect over
+WSS, normally to `wss://host:443/ws`.
 
 | Mode | Server flags | Requirements |
 |---|---|---|
 | **Automatic Let's Encrypt** | `--acme-domain relay.example.com [--acme-email you@example.com]` | public DNS name pointing at the relay; TCP **443** reachable from the internet; writable ACME cache |
 | **Existing certificate** | `--tls-cert fullchain.pem --tls-key privkey.pem` | PEM chain and matching unencrypted private key readable by the relay |
 | **Self-signed** | `--self-signed` | local testing; every client needs `--insecure` |
+| **Local reverse proxy** | `--plaintext --listen 127.0.0.1:8443` | loopback bind only; nginx/Caddy terminates public TLS |
 
 ACME uses **TLS-ALPN-01**, so only TCP 443 is needed — there is no HTTP-01
 challenge and no port 80 listener. The certificate is obtained on first start and
@@ -48,9 +49,44 @@ Binding 443 normally needs root or `CAP_NET_BIND_SERVICE`. If another service
 owns 443, listen on a higher port and forward **external TCP 443** to it — for
 example `--listen 0.0.0.0:8443` plus a DNAT/load-balancer rule. The ACME
 validation still arrives on external 443. A reverse proxy must pass TLS through
-to the relay (TCP or TLS passthrough); terminating TLS at an HTTP proxy does not
-work, because the relay has no plaintext backend and runs its own WebSocket
-upgrade.
+to the relay (TCP or TLS passthrough); terminating TLS at an HTTP proxy requires
+the plaintext mode below, because the relay normally has no plaintext backend.
+
+### nginx terminating TLS
+
+If nginx owns 443 and manages the certificate, run the relay on loopback with TLS
+disabled:
+
+```bash
+reaven server --listen 127.0.0.1:8443 --plaintext --password 'long-random-secret'
+```
+
+```nginx
+server {
+    listen 443 ssl;
+    server_name relay.example.com;
+
+    ssl_certificate     /etc/letsencrypt/live/relay.example.com/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/relay.example.com/privkey.pem;
+
+    location /ws {
+        proxy_pass http://127.0.0.1:8443;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_set_header Host $host;
+        proxy_read_timeout 3600s;
+        proxy_send_timeout 3600s;
+        proxy_buffering off;
+    }
+}
+```
+
+The relay refuses `--plaintext` on a non-loopback address, so the unencrypted
+listener cannot be exposed by accident. External agents/operators still use
+`wss://relay.example.com/ws`; only the nginx-to-relay hop is plaintext. The
+certificate is managed by nginx (for example certbot), not by Reaven. For a direct
+local test, connect with `ws://127.0.0.1:8443/ws`.
 
 Clients validate the certificate and hostname against the built-in WebPKI roots.
 Use `--insecure` (or `REAVEN_INSECURE=true`) only for a self-signed/local relay:
@@ -94,7 +130,7 @@ XWayland): $DISPLAY variable not set and no value was provided explicitly
 
 | Feature | Needs |
 |---|---|
-| relay | TCP 443 (or a forwarded port), TLS certificate mode, root/`CAP_NET_BIND_SERVICE` for 443 |
+| relay | TCP 443 (or loopback behind a TLS proxy), a TLS mode or `--plaintext`, root/`CAP_NET_BIND_SERVICE` for 443 |
 | agent / operator | outbound TCP 443, DNS, a trusted certificate (or `--insecure` for self-signed) |
 | relay, `exec`, `cl`, upload/download | nothing else — works headless |
 | screenshot / screen stream | an X11 display (`DISPLAY`), or XWayland on Wayland |

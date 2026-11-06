@@ -41,7 +41,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Run the WSS relay. Use --acme-domain for an automatic Let's Encrypt certificate.
+    /// Run the relay over WSS (or loopback --plaintext behind a TLS proxy).
     Server {
         #[arg(long, default_value = "0.0.0.0:443")]
         listen: String,
@@ -68,6 +68,9 @@ enum Commands {
         /// Generate a throwaway self-signed certificate for local testing.
         #[arg(long = "self-signed")]
         self_signed: bool,
+        /// Disable TLS and serve plain WS on loopback only (for a local reverse proxy).
+        #[arg(long = "plaintext", alias = "no-tls")]
+        plaintext: bool,
     },
     /// Register this computer as an online peer (run in the background for availability).
     Connect {
@@ -308,11 +311,13 @@ async fn main() -> Result<()> {
             tls_cert,
             tls_key,
             self_signed,
+            plaintext,
         } => {
             relay::run_server(
                 &listen,
                 password,
                 TlsOptions {
+                    plaintext,
                     acme_domains,
                     acme_email,
                     acme_cache,

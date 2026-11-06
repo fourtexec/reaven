@@ -1,7 +1,9 @@
 //! TLS front door for the relay.
 //!
-//! Three modes, in priority order:
+//! Modes, in priority order:
 //!
+//! * **Plain WS** (`--plaintext`): no TLS at all, allowed only on a loopback
+//!   address. Intended for a local TLS-terminating reverse proxy such as nginx.
 //! * **ACME** (`--acme-domain`): obtain and renew a Let's Encrypt certificate
 //!   automatically using TLS-ALPN-01. No HTTP challenge server is needed, and
 //!   the certificate is served on the same port as the relay. Port 443 is
@@ -10,8 +12,8 @@
 //! * **Self-signed** (`--self-signed`): generate a throwaway certificate for
 //!   local testing. Clients must use `--insecure`.
 //!
-//! All accepted TLS streams are handed to the relay through one channel, so the
-//! rest of the program does not care which certificate backend is in use.
+//! With TLS, accepted streams are handed to the relay through one channel, so
+//! the rest of the program does not care which certificate backend is in use.
 
 use std::io::BufReader;
 use std::path::{Path, PathBuf};
@@ -30,6 +32,9 @@ use crate::transport::BoxedIo;
 
 #[derive(Debug, Clone, Default)]
 pub struct TlsOptions {
+    /// Serve plain WS without a TLS listener. Only allowed on loopback, for a
+    /// local TLS-terminating reverse proxy such as nginx.
+    pub plaintext: bool,
     pub acme_domains: Vec<String>,
     pub acme_email: Option<String>,
     pub acme_cache: PathBuf,
@@ -49,13 +54,57 @@ pub async fn bind(listen: &str, options: TlsOptions) -> Result<mpsc::Receiver<Bo
     let local = listener.local_addr()?;
     let (tx, rx) = mpsc::channel::<BoxedIo>(64);
 
-    if !options.acme_domains.is_empty() {
+    if options.plaintext {
+        if !options.acme_domains.is_empty()
+            || options.cert.is_some()
+            || options.key.is_some()
+            || options.self_signed
+        {
+            bail!(
+                "--plaintext cannot be combined with --acme-domain, --tls-cert/--tls-key, \
+                 or --self-signed"
+            );
+        }
+        if !local.ip().is_loopback() {
+            bail!(
+                "--plaintext is only allowed on a loopback address, but this listener is \
+                 bound to {}. Use --listen 127.0.0.1:<port> (or [::1]:<port>) and let a \
+                 local reverse proxy terminate TLS.",
+                local
+            );
+        }
+        eprintln!(
+            "WARNING: TLS is disabled (--plaintext). Only use this behind a local \
+             TLS-terminating reverse proxy; never expose {} directly.",
+            local
+        );
+        start_plain(listener, tx);
+    } else if !options.acme_domains.is_empty() {
         start_acme(listener, local.port(), options, tx);
     } else {
         let acceptor = build_acceptor(&options)?;
         start_tls(listener, acceptor, tx);
     }
     Ok(rx)
+}
+
+fn start_plain(listener: TcpListener, tx: mpsc::Sender<BoxedIo>) {
+    tokio::spawn(async move {
+        loop {
+            let (tcp, _remote) = match listener.accept().await {
+                Ok(pair) => pair,
+                Err(e) => {
+                    eprintln!("accept error: {e}");
+                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                    continue;
+                }
+            };
+            let _ = tcp.set_nodelay(true);
+            if tx.send(Box::new(tcp)).await.is_err() {
+                break;
+            }
+        }
+    });
 }
 
 fn start_acme(listener: TcpListener, port: u16, options: TlsOptions, tx: mpsc::Sender<BoxedIo>) {
@@ -221,4 +270,51 @@ pub fn default_acme_cache() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."))
         .join(".reaven")
         .join("acme")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn plaintext_accepts_loopback() {
+        let _rx = bind(
+            "127.0.0.1:0",
+            TlsOptions {
+                plaintext: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("loopback plaintext listener");
+    }
+
+    #[tokio::test]
+    async fn plaintext_rejects_non_loopback() {
+        let err = bind(
+            "0.0.0.0:0",
+            TlsOptions {
+                plaintext: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect_err("non-loopback plaintext listener must be refused");
+        assert!(err.to_string().contains("loopback"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn plaintext_rejects_tls_flags() {
+        let err = bind(
+            "127.0.0.1:0",
+            TlsOptions {
+                plaintext: true,
+                self_signed: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect_err("--plaintext must conflict with TLS modes");
+        assert!(err.to_string().contains("cannot be combined"), "{err}");
+    }
 }
