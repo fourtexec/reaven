@@ -12,6 +12,7 @@ jobs:
     name: Build for ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
     strategy:
+      fail-fast: false
       matrix:
         include:
           - os: ubuntu-latest
@@ -31,6 +32,9 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: ${{ matrix.target }}
+          # Сохраняем кэш только для основной ветки, чтобы ветки с PR
+          # не засоряли общий кэш и не сбрасывали его [citation:2][citation:5]
+          save-if: ${{ github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master' }}
 
       - name: Install musl tools (Linux only)
         if: matrix.os == 'ubuntu-latest'
@@ -38,8 +42,19 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y musl-tools musl-dev
 
+      - name: Setup sccache
+        uses: mozilla-actions/sccache-action@v0.0.9
+
       - name: Build release
         run: cargo build --release --target ${{ matrix.target }}
+        env:
+          # sccache кэширует результаты компиляции отдельных крейтов,
+          # что ускоряет пересборку только изменённых частей [citation:3][citation:15]
+          RUSTC_WRAPPER: sccache
+          SCCACHE_GHA_ENABLED: "true"
+          # Отключаем инкрементальную компиляцию, чтобы избежать конфликтов
+          # с кэшем sccache в CI-окружении
+          CARGO_INCREMENTAL: "0"
 
       - name: Rename artifact
         shell: bash
