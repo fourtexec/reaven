@@ -797,8 +797,12 @@ pub async fn run_cl(
         from: String::new(),
         to: target.to_string(),
     });
+    // Let the writer drain ShellClose before it is dropped. Aborting the task
+    // here races the queued close frame and can leave the remote PTY/bash alive
+    // after the operator detaches or the local terminal exits.
+    drop(out_tx);
     let _ = input_thread.join();
-    writer.abort();
+    let _ = writer.await;
     result
 }
 

@@ -130,9 +130,25 @@ async fn serve_connection(stream: BoxedIo, peers: PeerMap, password: Option<Stri
 
     write.send(&Frame::Welcome).await?;
     let writer = tokio::spawn(async move {
-        while let Some(frame) = rx.recv().await {
-            if write.send(&frame).await.is_err() {
-                break;
+        let mut heartbeat = tokio::time::interval(Duration::from_secs(25));
+        heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // interval() ticks immediately; wait a full period before first ping.
+        heartbeat.tick().await;
+        loop {
+            tokio::select! {
+                frame = rx.recv() => match frame {
+                    Some(frame) => {
+                        if write.send(&frame).await.is_err() {
+                            break;
+                        }
+                    }
+                    None => break,
+                },
+                _ = heartbeat.tick() => {
+                    if write.ping().await.is_err() {
+                        break;
+                    }
+                }
             }
         }
     });

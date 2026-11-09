@@ -248,6 +248,15 @@ impl<S: AsyncIo> FrameWriter<S> {
             .await
             .context("writing WebSocket message")
     }
+
+    /// Send a WebSocket control ping. The remote WebSocket implementation
+    /// automatically responds with a pong, keeping idle proxy connections alive.
+    pub async fn ping(&mut self) -> Result<()> {
+        self.inner
+            .send(Message::Ping(Default::default()))
+            .await
+            .context("writing WebSocket ping")
+    }
 }
 
 #[cfg(test)]

@@ -68,6 +68,60 @@ pub async fn run_peer(
     insecure: bool,
     options: AgentOptions,
 ) -> Result<()> {
+    // A transient relay/proxy/network timeout must not permanently take the
+    // agent offline. Retry transport failures with capped exponential backoff;
+    // authentication and protocol errors still return to the caller.
+    let mut retry_seconds = 1_u64;
+    loop {
+        match run_peer_session(server, name, password.clone(), insecure, options).await {
+            Ok(()) => return Ok(()),
+            Err(error) if is_transient_transport_error(&error) => {
+                eprintln!(
+                    "relay connection lost ({error:#}); reconnecting in {retry_seconds}s"
+                );
+                tokio::time::sleep(Duration::from_secs(retry_seconds)).await;
+                retry_seconds = (retry_seconds * 2).min(30);
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+fn is_transient_transport_error(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        if let Some(io_error) = cause.downcast_ref::<std::io::Error>() {
+            if matches!(
+                io_error.kind(),
+                std::io::ErrorKind::TimedOut
+                    | std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::ConnectionAborted
+                    | std::io::ErrorKind::NotConnected
+                    | std::io::ErrorKind::BrokenPipe
+                    | std::io::ErrorKind::UnexpectedEof
+                    | std::io::ErrorKind::ConnectionRefused
+                    | std::io::ErrorKind::Interrupted
+                    | std::io::ErrorKind::WouldBlock
+            ) {
+                return true;
+            }
+        }
+        let message = cause.to_string().to_ascii_lowercase();
+        message.contains("connection closed")
+            || message.contains("timed out")
+            || message.contains("timeout")
+            || message.contains("deadline has elapsed")
+            || message.contains("temporary failure in name resolution")
+            || message.contains("network is unreachable")
+    })
+}
+
+async fn run_peer_session(
+    server: &str,
+    name: &str,
+    password: Option<String>,
+    insecure: bool,
+    options: AgentOptions,
+) -> Result<()> {
     let ws = transport::connect(server, insecure).await?;
     let (mut reader, mut write) = ws.split();
 
@@ -281,9 +335,13 @@ pub async fn run_peer(
     }
     .await;
 
-    // Tear down any streams still running so capture threads do not outlive us.
+    // Tear down session-owned work before reconnecting. Otherwise a transient
+    // socket failure could leave a PTY shell or capture thread behind.
     for (_, ctx) in streams.lock().unwrap().drain() {
         ctx.stop.store(true, Ordering::Relaxed);
+    }
+    for (_, sender) in shells.lock().unwrap().drain() {
+        let _ = sender.send(ShellControl::Close);
     }
     writer.abort();
     result
